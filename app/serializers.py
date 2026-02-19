@@ -90,3 +90,15 @@ class RiskActivitySerializer(serializers.ModelSerializer):
             "at",
             "diff",
         ]
+        
+
+class StatusSerializer(serializers.Serializer):
+    STATUS_CHOICES = [
+        ("OPEN", "Open"),
+        ("IN_PROGRESS", "In Progress"),
+        ("MITIGATED", "Mitigated"),
+        ("ACCEPTED", "Accepted"),
+        ("CLOSED", "Closed"),
+    ]
+
+    status = serializers.ChoiceField(choices=STATUS_CHOICES)

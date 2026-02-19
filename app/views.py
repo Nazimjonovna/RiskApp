@@ -1,10 +1,12 @@
+from datetime import timedelta
+from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from drf_yasg.utils import swagger_auto_schema
 from .serializers import (RiskActivitySerializer, RiskCommitteeSerializer, RiskDecisionSerializer,
-                          RiskSerializer, MitigationSerializer, DepartmentSerializer)
+                          RiskSerializer, MitigationSerializer, DepartmentSerializer, StatusSerializer)
 from .models import (Department, Risk, RiskActivity, RiskCommittee, RiskDecision,
                      Mitigation)
 
@@ -70,7 +72,7 @@ class DepartmentCRUDView(APIView):
     def patch(self, request, pk, *args, **kwargs):
         department = Department.objects.filter(id =pk).first()
         if department:
-            serializer = DepartmentSerializer(intanse = department, data = request.data, partial = True)
+            serializer = DepartmentSerializer(intance = department, data = request.data, partial = True)
             if serializer.is_valid():
                 serializer.save()
                 return Response({
@@ -146,7 +148,7 @@ class RiskCRUDView(APIView):
     def patch(self, request, pk, *args, **kwargs):
         risk = Risk.objects.filter(id =pk).first()
         if risk:
-            serializer = RiskSerializer(intanse = risk, data = request.data, partial = True)
+            serializer = RiskSerializer(intance = risk, data = request.data, partial = True)
             if serializer.is_valid():
                 serializer.save()
                 return Response({
@@ -222,7 +224,7 @@ class RiskActivityCRUDView(APIView):
     def patch(self, request, pk, *args, **kwargs):
         riskactivity = RiskActivity.objects.filter(id =pk).first()
         if riskactivity:
-            serializer = RiskActivitySerializer(intanse = riskactivity, data = request.data, partial = True)
+            serializer = RiskActivitySerializer(intance = riskactivity, data = request.data, partial = True)
             if serializer.is_valid():
                 serializer.save()
                 return Response({
@@ -237,3 +239,299 @@ class RiskActivityCRUDView(APIView):
             return Response({
                 "status":status.HTTP_404_NOT_FOUND
             })
+            
+            
+class CreateRiskCommitteeView(APIView):
+    parser_classes = [IsAuthenticated, ]
+    
+    @swagger_auto_schema(request_body=RiskCommitteeSerializer, tags = ['RiskCommittee'])
+    def post(self, request, *args, **kwargs):
+        serializer = RiskCommitteeSerializer(data = request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response({
+                "data":serializer.data,
+                "status":status.HTTP_200_OK
+            })
+        else:
+            return Response({
+                "errors":serializer.errors
+            })
+            
+    @swagger_auto_schema(tags = ['RiskCommittee'])
+    def get(self, request, *args, **kwargs):
+        data = RiskCommittee.objects.all()
+        serializer = RiskCommitteeSerializer(data, many = True)
+        return Response({
+            "data":serializer.data,
+            "status":status.HTTP_200_OK
+        })
+        
+        
+class RiskCommitteeCRUDView(APIView):
+    permission_classes = [IsAuthenticated, ]
+    
+    @swagger_auto_schema(tags = ["RiskCommittee"])
+    def get(self, request, pk, *args, **kwargs):
+        data = RiskCommittee.objects.filter(id = pk).first()
+        if data:
+            seralizer = RiskCommitteeSerializer(data)
+            return Response({
+                "data":seralizer.data,
+                "status":status.HTTP_200_OK
+            })
+        else:
+            return Response({
+                "data":"Bunday ma'lumot topilmadi",
+                "status":status.HTTP_404_NOT_FOUND
+            })
+            
+    @swagger_auto_schema(tags = ["RiskCommittee"])
+    def delete(self, request, pk, *args, **kwargs):
+        data = RiskCommittee.objects.get(id = pk)
+        if data:
+            data.delete()
+            return Response({
+                "satatus":status.HTTP_200_OK
+            })
+        else:
+            return Response({
+                "data":"Bunday ma'lumot topilmadi",
+                "status":status.HTTP_404_NOT_FOUND
+            })
+            
+    @swagger_auto_schema(request_body=RiskCommitteeSerializer, tags = ['RiskCommittee'])
+    def patch(self, request, pk, *args, **kwargs):
+        data1 = RiskCommittee.objects.filter(id = pk).first()
+        if data1:
+            serializer = RiskCommitteeSerializer(instance = data1, data = request.data, partial = True)
+            if serializer.is_valid():
+                serializer.save()
+                return Response({
+                    "data":serializer.data,
+                    "status":status.HTTP_200_OK
+                })
+            else:
+                return Response({
+                    "errors":serializer.errors
+                })
+        else:
+            return Response({
+                "data":"Bunday ma'lumot topilmadi",
+                "status":status.HTTP_404_NOT_FOUND
+            })
+            
+            
+class CreateRiskDecisionView(APIView):
+    permission_classes = [IsAuthenticated, ]
+    
+    @swagger_auto_schema(request_body=RiskDecisionSerializer, tags = ['RiskDecision'])
+    def post(self, request, *args, **kwargs):
+        serializer = RiskDecisionSerializer(data = request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response({
+                "data":serializer.data,
+                "status":status.HTTP_201_CREATED
+            })
+        else:
+            return Response({
+                "errors":serializer.errors
+            })
+            
+    @swagger_auto_schema(tags = ['RiskDecision'])
+    def get(self, request, *args, **kwargs):
+        decisition = RiskDecision.objects.all()
+        serializer = RiskDecisionSerializer(decisition, many = True)
+        return Response({
+            "data":serializer.data,
+            "status":status.HTTP_200_OK
+        })
+        
+        
+class RiskDecisionCRUDView(APIView):
+    permission_classes = [IsAuthenticated, ]
+    
+    @swagger_auto_schema(tags = ['RiskDecision'])
+    def get(self, request, pk, *args, **kwargs):
+        decisition = RiskDecision.objects.filter(id = pk).first()
+        if decisition:
+            serializer = RiskDecisionSerializer(decisition)
+            return Response({
+                "data":serializer.data,
+                "status":status.HTTP_200_OK
+            })
+        else:
+            return Response({
+                "data":"Bunday ma'lumot topilmadi",
+                "status":status.HTTP_404_NOT_FOUND
+            })
+            
+    @swagger_auto_schema(tags = ['RiskDecision'])
+    def delete(self, request, pk, *args, **kwargs):
+        decisition = RiskDecision.objects.filter(id = pk).first()
+        if decisition:
+            decisition.delete
+            return Response({
+                "status":status.HTTP_200_OK
+            })
+        else:
+            return Response({
+                "data":"Bunday ma'lumot topilmadi",
+                "status":status.HTTP_404_NOT_FOUND
+            })
+            
+    @swagger_auto_schema(request_body=RiskDecisionSerializer, tags = ['RiskDecision'])
+    def patch(self, request, pk, *args, **kwargs):
+        decisition = RiskDecision.objects.filter(id = pk).first()
+        if decisition:
+            serializer = RiskDecisionSerializer(instance = decisition, data = request.data, partial = True)
+            if serializer.is_valid():
+                serializer.save()
+                return Response({
+                    "data":serializer.data,
+                    'status':status.HTTP_201_CREATED
+                })
+            else:
+                return Response({
+                    "errors":serializer.errors
+                })
+        else:
+            return Response({
+                "data":"Bunday ma'lumot topilmadi",
+                "status":status.HTTP_404_NOT_FOUND
+            })
+            
+            
+class CreateMitigationView(APIView):
+    permission_classes = [IsAuthenticated, ]
+    
+    @swagger_auto_schema(request_body=MitigationSerializer, tags = ['Mitigation'])
+    def post(self, request, *args, **kwargs):
+        serialzier = MitigationSerializer(data = request.data)
+        if serialzier.is_valid():
+            serialzier.save()
+            return Response({
+                "data":serialzier.data,
+                "status":status.HTTP_201_CREATED
+            })
+        else:
+            return Response({
+                "errors":serialzier.errors
+            })
+            
+    @swagger_auto_schema(tags = ['Mitigation'])
+    def get(self, request, *args, **kwargs):
+        mitigation = Mitigation.objects.all()
+        seralizer = MitigationSerializer(mitigation, many =True)
+        return Response({
+            "data":seralizer.data,
+            "status":status.HTTP_200_OK
+        })
+        
+
+class MitigationCRUDView(APIView):
+    permission_classes = [IsAuthenticated, ]
+    
+    @swagger_auto_schema(tags = ['Mitigation'])
+    def get(self, request, pk, *args, **kwargs):
+        mitigation = Mitigation.objects.filter(id - pk).first()
+        if mitigation:
+            serializer = MitigationSerializer(mitigation)
+            return Response({
+                "data":serializer.data,
+                "status":status.HTTP_200_OK
+            })
+        else:
+            return Response({
+                "data":"Bunday ma'lumot topilmadi",
+                "status":status.HTTP_404_NOT_FOUND
+            })
+            
+    @swagger_auto_schema(tags = ['Mitigation'])
+    def delete(self, request, pk, *args, **kwargs):
+        mitigation = Mitigation.objects.filter(id = pk).first()
+        if mitigation:
+            mitigation.delete()
+            return Response({
+                "status":status.HTTP_200_OK
+            })
+        else:
+            return Response({
+                "data":"Bunday ma'lumot topilmadi",
+                "status":status.HTTP_404_NOT_FOUND
+            })
+    
+    @swagger_auto_schema(request_body=MitigationSerializer, tags = ['Mitigation'])
+    def patch(self, request, pk, *args, **kwargs):
+        mitigation = Mitigation.objects.get(id = pk)
+        if mitigation:
+            serializer = MitigationSerializer(instance = mitigation, data = request.data, partial = True)
+            if serializer.is_valid():
+                serializer.save()
+                return Response({
+                    "data":serializer.data,
+                    "status":status.HTTP_201_CREATED
+                })
+            else:
+                return Response({
+                    "errors":serializer.errors
+                })
+        else:
+            return Response({
+                "data":"Bunday ma'lumot topilmadi",
+                "status":status.HTTP_404_NOT_FOUND
+            })
+            
+            
+class GetRiskMitigationView(APIView):
+    permission_classes = [IsAuthenticated, ]
+    
+    @swagger_auto_schema(tags = ['Filters'])
+    def get(self, request, pk, *args, **kwargs):
+        mitigations = Mitigation.objects.filter(risk_id = pk)
+        serializer = MitigationSerializer(mitigations, many =True)
+        return Response({
+            "data":serializer.data,
+            "status":status.HTTP_200_OK
+        })
+        
+
+class FilterRiskByStatusView(APIView):
+    permission_classes = [IsAuthenticated, ]
+    
+    @swagger_auto_schema(request_body=StatusSerializer, tags = ['Filters'])
+    def post(self, request, *args, **kwargs):
+        risk = Risk.objects.filter(status = request.data)
+        if risk:
+            serializer = RiskSerializer(risk, many = True)
+            return Response({
+                "data":serializer.data,
+                "status":status.HTTP_200_OK
+            })
+        else:
+            return Response({
+                "data":"Bunday ma'lumot topilmadi",
+                "status":status.HTTP_404_NOT_FOUND
+            })
+            
+            
+class UpcomingRiskAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        today = timezone.now()
+        ten_days_later = today + timedelta(days=10)
+        risks = Risk.objects.filter(
+            status__in=["OPEN", "IN_PROGRESS", "MITIGATED", "ACCEPTED"],
+            due_date__gte=today,
+            due_date__lte=ten_days_later
+        ).order_by("due_date") 
+        serializer = RiskSerializer(risks, many=True)
+        return Response(
+            {
+                "count": risks.count(),
+                "data": serializer.data
+            },
+            status=status.HTTP_200_OK
+        )
