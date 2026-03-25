@@ -15,13 +15,11 @@ COPY requirements.txt .
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
-# Project copy
 COPY . .
 
-RUN mkdir -p static
-
-# Collect static files
-RUN python manage.py collectstatic --noinput
+# Static fayllarni collect qilish
+# Static fayllarni collect qilish
+RUN DJANGO_SETTINGS_MODULE=conf.settings python manage.py collectstatic --noinput
 
 EXPOSE 8000
 
