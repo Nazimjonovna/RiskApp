@@ -1,10 +1,11 @@
 from rest_framework import serializers
-from .models import Department, Risk, RiskCommittee, Mitigation, RiskDecision, RiskActivity, Category
+from .models import Department, Risk, RiskCommittee, Mitigation, RiskDecition, RiskActivity, Category
 
 class DepartmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Department
         fields = [
+            'id',
             "name",
         ]
         
@@ -53,8 +54,8 @@ class RiskCommitteeSerializer(serializers.ModelSerializer):
     class Meta:
         model = RiskCommittee
         fields = [
-            "last_decision",
-            "last_decision_at",
+            "last_decition",
+            "last_decition_at",
             "risk",
         ]
         
@@ -76,10 +77,10 @@ class MitigationSerializer(serializers.ModelSerializer):
         
 class RiskDecisionSerializer(serializers.ModelSerializer):
     class Meta:
-        model = RiskDecision
+        model = RiskDecition
         fields = [
             "risk",
-            "decision_type",
+            "decition_type",
             "decided_by",
             "decided_at",
             "notes",

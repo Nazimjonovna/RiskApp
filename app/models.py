@@ -91,8 +91,8 @@ class RiskCommittee(models.Model):
         on_delete=models.CASCADE,
         related_name="committee"
     )
-    last_decision = models.TextField(blank=True)
-    last_decision_at = models.DateTimeField(null=True, blank=True)
+    last_decition = models.TextField(blank=True)
+    last_decition_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
         return f"Committee decision for {self.risk.id}"
@@ -128,8 +128,8 @@ class Mitigation(models.Model):
         return f"{self.risk.id} - {self.title}"
     
     
-class RiskDecision(models.Model):
-    DECISION_CHOICES = [
+class RiskDecition(models.Model):
+    DECITION_CHOICES = [
         ("APPROVE", "Approve"),
         ("REJECT", "Reject"),
         ("REQUEST_INFO", "Request Info"),
@@ -140,9 +140,9 @@ class RiskDecision(models.Model):
         on_delete=models.CASCADE,
         related_name="decisions"
     )
-    decision_type = models.CharField(
+    decition_type = models.CharField(
         max_length=30,
-        choices=DECISION_CHOICES
+        choices=DECITION_CHOICES
     )
     decided_by = models.CharField(max_length=500)
     decided_at = models.DateTimeField(default=timezone.now)
@@ -152,7 +152,7 @@ class RiskDecision(models.Model):
         ordering = ["-decided_at"]
 
     def __str__(self):
-        return f"{self.risk.id} - {self.decision_type}"
+        return f"{self.risk.id} - {self.decition_type}"
 
 
 class RiskActivity(models.Model):

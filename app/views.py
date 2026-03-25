@@ -8,7 +8,7 @@ from drf_yasg.utils import swagger_auto_schema
 from .serializers import (RiskActivitySerializer, RiskCommitteeSerializer, RiskDecisionSerializer,
                           RiskSerializer, MitigationSerializer, DepartmentSerializer, StatusSerializer,
                           CategorySerializer)
-from .models import (Department, Category,  Risk, RiskActivity, RiskCommittee, RiskDecision,
+from .models import (Department, Category,  Risk, RiskActivity, RiskCommittee, RiskDecition,
                      Mitigation)
 
 
@@ -403,10 +403,10 @@ class RiskCommitteeCRUDView(APIView):
             })
             
             
-class CreateRiskDecisionView(APIView):
+class CreateRiskDecitionView(APIView):
     # permission_classes = [IsAuthenticated, ]
     
-    @swagger_auto_schema(request_body=RiskDecisionSerializer, tags = ['RiskDecision'])
+    @swagger_auto_schema(request_body=RiskDecisionSerializer, tags = ['RiskDecition'])
     def post(self, request, *args, **kwargs):
         serializer = RiskDecisionSerializer(data = request.data)
         if serializer.is_valid():
@@ -420,9 +420,9 @@ class CreateRiskDecisionView(APIView):
                 "errors":serializer.errors
             })
             
-    @swagger_auto_schema(tags = ['RiskDecision'])
+    @swagger_auto_schema(tags = ['RiskDecition'])
     def get(self, request, *args, **kwargs):
-        decisition = RiskDecision.objects.all()
+        decisition = RiskDecition.objects.all()
         serializer = RiskDecisionSerializer(decisition, many = True)
         return Response({
             "data":serializer.data,
@@ -430,12 +430,12 @@ class CreateRiskDecisionView(APIView):
         })
         
         
-class RiskDecisionCRUDView(APIView):
+class RiskDecitionCRUDView(APIView):
     # permission_classes = [IsAuthenticated, ]
     
-    @swagger_auto_schema(tags = ['RiskDecision'])
+    @swagger_auto_schema(tags = ['RiskDecition'])
     def get(self, request, pk, *args, **kwargs):
-        decisition = RiskDecision.objects.filter(id = pk).first()
+        decisition = RiskDecition.objects.filter(id = pk).first()
         if decisition:
             serializer = RiskDecisionSerializer(decisition)
             return Response({
@@ -448,9 +448,9 @@ class RiskDecisionCRUDView(APIView):
                 "status":status.HTTP_404_NOT_FOUND
             })
             
-    @swagger_auto_schema(tags = ['RiskDecision'])
+    @swagger_auto_schema(tags = ['RiskDecition'])
     def delete(self, request, pk, *args, **kwargs):
-        decisition = RiskDecision.objects.filter(id = pk).first()
+        decisition = RiskDecition.objects.filter(id = pk).first()
         if decisition:
             decisition.delete
             return Response({
@@ -462,9 +462,9 @@ class RiskDecisionCRUDView(APIView):
                 "status":status.HTTP_404_NOT_FOUND
             })
             
-    @swagger_auto_schema(request_body=RiskDecisionSerializer, tags = ['RiskDecision'])
+    @swagger_auto_schema(request_body=RiskDecisionSerializer, tags = ['RiskDecition'])
     def patch(self, request, pk, *args, **kwargs):
-        decisition = RiskDecision.objects.filter(id = pk).first()
+        decisition = RiskDecition.objects.filter(id = pk).first()
         if decisition:
             serializer = RiskDecisionSerializer(instance = decisition, data = request.data, partial = True)
             if serializer.is_valid():
