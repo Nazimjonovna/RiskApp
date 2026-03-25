@@ -450,7 +450,7 @@ class RiskDecitionCRUDView(APIView):
     def delete(self, request, pk, *args, **kwargs):
         decisition = RiskDecition.objects.filter(id = pk).first()
         if decisition:
-            decisition.delete
+            decisition.delete()
             return Response({
                 "status":status.HTTP_200_OK
             })
