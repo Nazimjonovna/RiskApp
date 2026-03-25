@@ -22,7 +22,6 @@ class DepartmentView(APIView):
             instance = serializer.save()
             return Response({
                 "data":serializer.data,
-                "id":instance.id,
                 "status":status.HTTP_201_CREATED
             })
         else:
@@ -101,7 +100,6 @@ class CategoryView(APIView):
             instance = serializer.save()
             return Response({
                 "data":serializer.data,
-                "id":instance.id,
                 "status":status.HTTP_201_CREATED
             })
         else:
@@ -583,7 +581,7 @@ class FilterRiskByStatusView(APIView):
     
     @swagger_auto_schema(request_body=StatusSerializer, tags = ['Filters'])
     def post(self, request, *args, **kwargs):
-        risk = Risk.objects.filter(status = request.data)
+        risk = Risk.objects.filter(status = request.data.get("status"))
         if risk:
             serializer = RiskSerializer(risk, many = True)
             return Response({
