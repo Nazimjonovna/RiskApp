@@ -516,7 +516,7 @@ class MitigationCRUDView(APIView):
     
     @swagger_auto_schema(tags = ['Mitigation'])
     def get(self, request, pk, *args, **kwargs):
-        mitigation = Mitigation.objects.filter(id - pk).first()
+        mitigation = Mitigation.objects.filter(id = pk).first()
         if mitigation:
             serializer = MitigationSerializer(mitigation)
             return Response({
