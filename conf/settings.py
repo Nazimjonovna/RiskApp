@@ -26,7 +26,7 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ['*']
 
 
 # Application definition
@@ -42,6 +42,18 @@ INSTALLED_APPS = [
     "rest_framework",
     "drf_yasg",
 ]
+
+SWAGGER_SETTINGS = {
+    'SECURITY_DEFINITIONS': {
+        'Bearer': {
+            'type': 'apiKey',
+            'name': 'Authorization',
+            'in': 'header',
+            'description': 'Bearer <token> formatida kiriting. Masalan: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
+        }
+    },
+    'USE_SESSION_AUTH': False,  # Username/password oynasini yo‘qotadi
+}
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -123,3 +135,33 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STATIC_URL = '/static/'  # slashtan boshlash tavsiya etiladi
+# Agar STATICFILES_DIRS allaqachon bo'lmasa:
+STATICFILES_DIRS = [
+    os.path.join(BASE_DIR, "static"),  # logos papkani qo'shish
+]
+STATIC_ROOT = os.path.join(BASE_DIR, "staticfiles")
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+
+MEDIA_URL = '/images/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'images')
+
+# Default primary key field type
+# https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
+
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# CORS/CSRF for frontend
+# In development, you can allow all origins. For production, restrict to known domains.
+CORS_ALLOW_ALL_ORIGINS = True
+CSRF_COOKIE_SECURE = False
+CSRF_TRUSTED_ORIGINS = [
+    'http://localhost:8000',
+    'http://127.0.0.1:8000', 
+    'http://172.16.55.9:8000',
+    'http://172.16.55.9:3000',
+    'http://172.16.55.9:3030'
+]
