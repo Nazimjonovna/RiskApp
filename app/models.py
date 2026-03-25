@@ -10,6 +10,11 @@ class Department(models.Model):
     def __str__(self):
         return self.name
 
+class Category(models.Model):
+    name = models.CharField(max_length=255)
+
+    def __str__(self):
+        return self.name
 
 class Risk(models.Model):
 
@@ -20,22 +25,17 @@ class Risk(models.Model):
         ("ACCEPTED", "Accepted"),
         ("CLOSED", "Closed"),
     ]
-
-    CATEGORY_CHOICES = [
-        ("STRATEGIC", "Strategic"),
-        ("FINANCIAL", "Financial"),
-        ("OPERATIONAL", "Operational"),
-        ("COMPLIANCE", "Compliance"),
-        ("LEGAL", "Legal"),
-        ("IT", "IT / Cyber"),
-        ("REPUTATIONAL", "Reputational"),
-    ]
     title = models.CharField(max_length=255)
     risk_number = models.CharField(max_length=20, unique=True, blank=True)
     description = models.TextField(blank=True)
-    category = models.CharField(max_length=50, choices=CATEGORY_CHOICES)
     department = models.ForeignKey(
         Department,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="risks"
+    )
+    category = models.ForeignKey(
+        Category,
         on_delete=models.SET_NULL,
         null=True,
         related_name="risks"

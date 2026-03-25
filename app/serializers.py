@@ -1,9 +1,17 @@
 from rest_framework import serializers
-from .models import Department, Risk, RiskCommittee, Mitigation, RiskDecision, RiskActivity
+from .models import Department, Risk, RiskCommittee, Mitigation, RiskDecision, RiskActivity, Category
 
 class DepartmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Department
+        fields = [
+            "name",
+        ]
+        
+
+class CategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Category
         fields = [
             "name",
         ]

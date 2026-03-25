@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import (DepartmentView, DepartmentCRUDView, CreateRiskView, RiskCRUDView, 
+from .views import (DepartmentView, DepartmentCRUDView, CategoryView, CategoryCRUDView, CreateRiskView, RiskCRUDView, 
                     CreateRiskActivityView, RiskActivityCRUDView, CreateRiskCommitteeView,
                     RiskCommitteeCRUDView, CreateRiskDecisionView, RiskDecisionCRUDView,
                     CreateMitigationView, MitigationCRUDView, GetRiskMitigationView,
@@ -9,6 +9,8 @@ from .views import (DepartmentView, DepartmentCRUDView, CreateRiskView, RiskCRUD
 urlpatterns = [
      path('api/create/department/', DepartmentView.as_view()),
      path("api/crud/department/<int:pk>/", DepartmentCRUDView.as_view()),
+     path('api/create/department/', CategoryView.as_view()),
+     path("api/crud/department/<int:pk>/", CategoryCRUDView.as_view()),
      path('api/create/risk/', CreateRiskView.as_view()),
      path('api/crud/risk/<int:pk>/', RiskCRUDView.as_view()),
      path('api/create/riskactivity/', CreateRiskActivityView.as_view()),

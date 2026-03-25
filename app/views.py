@@ -6,8 +6,9 @@ from rest_framework import status
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from drf_yasg.utils import swagger_auto_schema
 from .serializers import (RiskActivitySerializer, RiskCommitteeSerializer, RiskDecisionSerializer,
-                          RiskSerializer, MitigationSerializer, DepartmentSerializer, StatusSerializer)
-from .models import (Department, Risk, RiskActivity, RiskCommittee, RiskDecision,
+                          RiskSerializer, MitigationSerializer, DepartmentSerializer, StatusSerializer,
+                          CategorySerializer)
+from .models import (Department, Category,  Risk, RiskActivity, RiskCommittee, RiskDecision,
                      Mitigation)
 
 
@@ -74,6 +75,85 @@ class DepartmentCRUDView(APIView):
         department = Department.objects.filter(id =pk).first()
         if department:
             serializer = DepartmentSerializer(intance = department, data = request.data, partial = True)
+            if serializer.is_valid():
+                serializer.save()
+                return Response({
+                    "data":serializer.data,
+                    "status":status.HTTP_200_OK
+                })
+            else:
+                return Response({
+                    "errors":serializer.errors
+                })
+        else:
+            return Response({
+                "status":status.HTTP_404_NOT_FOUND
+            })
+            
+            
+class CategoryView(APIView):
+    # permission_classes = [IsAuthenticated]
+    
+    @swagger_auto_schema(request_body=CategorySerializer, tags = ['Category'])
+    def post(self, request, *args, **kwargs):
+        serializer = CategorySerializer(data = request.data)
+        if serializer.is_valid():
+            instance = serializer.save()
+            return Response({
+                "data":serializer.data,
+                "id":instance.id,
+                "status":status.HTTP_201_CREATED
+            })
+        else:
+            return Response({
+                "error":serializer.errors
+            })
+            
+    @swagger_auto_schema(tags = ['Category'])
+    def get(self, request, *args,**kwargs):
+        departments = Category.objects.all()
+        serializer = CategorySerializer(departments, many = True)
+        return Response({
+            "data":serializer.data,
+            "status":status.HTTP_200_OK
+        })
+        
+
+class CategoryCRUDView(APIView):
+    # permission_classes = [IsAuthenticated] # keyinchalik faqat risk role dagila qo'sha oladigan permission beramiz
+    
+    @swagger_auto_schema(tags = ['Category'])
+    def get(self, request, pk, *args, **kwargs):
+        department = Category.objects.filter(id = pk).first()
+        if department:
+            seralizer = CategorySerializer(department)
+            return Response({
+                "data":seralizer.data,
+                "status":status.HTTP_200_OK
+            })
+        else:
+            return Response({
+                "status":status.HTTP_404_NOT_FOUND
+            })
+            
+    @swagger_auto_schema(tags = ['Category'])
+    def delete(self, request, pk, *args, **kwargs):
+        department = Category.objects.get(id = pk)
+        if department:
+            department.delete()
+            return Response({
+                "status":status.HTTP_200_OK
+            })
+        else:
+            return Response({
+                "status":status.HTTP_404_NOT_FOUND
+            })
+            
+    @swagger_auto_schema(request_body=CategorySerializer, tags = ['Category'])
+    def patch(self, request, pk, *args, **kwargs):
+        department = Category.objects.filter(id =pk).first()
+        if department:
+            serializer = CategorySerializer(intance = department, data = request.data, partial = True)
             if serializer.is_valid():
                 serializer.save()
                 return Response({
