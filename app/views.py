@@ -12,7 +12,7 @@ from .models import (Department, Risk, RiskActivity, RiskCommittee, RiskDecision
 
 
 class DepartmentView(APIView):
-    permission_classes = [IsAuthenticated]
+    # permission_classes = [IsAuthenticated]
     
     @swagger_auto_schema(request_body=DepartmentSerializer, tags = ['Department'])
     def post(self, request, *args, **kwargs):
@@ -39,7 +39,7 @@ class DepartmentView(APIView):
         
 
 class DepartmentCRUDView(APIView):
-    permission_classes = [IsAuthenticated] # keyinchalik faqat risk role dagila qo'sha oladigan permission beramiz
+    # permission_classes = [IsAuthenticated] # keyinchalik faqat risk role dagila qo'sha oladigan permission beramiz
     
     @swagger_auto_schema(tags = ['Department'])
     def get(self, request, pk, *args, **kwargs):
@@ -90,7 +90,7 @@ class DepartmentCRUDView(APIView):
             
             
 class CreateRiskView(APIView):
-    permission_classes = [IsAuthenticated, ]
+    # permission_classes = [IsAuthenticated, ]
     
     @swagger_auto_schema(request_body=RiskSerializer, tags = ['Risk'])
     def post(self, request, *args, **kwargs):
@@ -116,7 +116,7 @@ class CreateRiskView(APIView):
         
         
 class RiskCRUDView(APIView):
-    permission_classes = [IsAuthenticated] 
+    # permission_classes = [IsAuthenticated] 
     
     @swagger_auto_schema(tags = ['Risk'])
     def get(self, request, pk, *args, **kwargs):
@@ -166,7 +166,7 @@ class RiskCRUDView(APIView):
             
 
 class CreateRiskActivityView(APIView):
-    permission_classes = [IsAuthenticated, ]
+    # permission_classes = [IsAuthenticated, ]
     
     @swagger_auto_schema(request_body=RiskActivitySerializer, tags = ['RiskActivity'])
     def post(self, request, *args, **kwargs):
@@ -192,7 +192,7 @@ class CreateRiskActivityView(APIView):
         
         
 class RiskActivityCRUDView(APIView):
-    permission_classes = [IsAuthenticated] 
+    # permission_classes = [IsAuthenticated] 
     
     @swagger_auto_schema(tags = ['RiskActivity'])
     def get(self, request, pk, *args, **kwargs):
@@ -242,7 +242,7 @@ class RiskActivityCRUDView(APIView):
             
             
 class CreateRiskCommitteeView(APIView):
-    parser_classes = [IsAuthenticated, ]
+    # parser_classes = [IsAuthenticated, ]
     
     @swagger_auto_schema(request_body=RiskCommitteeSerializer, tags = ['RiskCommittee'])
     def post(self, request, *args, **kwargs):
@@ -269,7 +269,7 @@ class CreateRiskCommitteeView(APIView):
         
         
 class RiskCommitteeCRUDView(APIView):
-    permission_classes = [IsAuthenticated, ]
+    # permission_classes = [IsAuthenticated, ]
     
     @swagger_auto_schema(tags = ["RiskCommittee"])
     def get(self, request, pk, *args, **kwargs):
@@ -323,7 +323,7 @@ class RiskCommitteeCRUDView(APIView):
             
             
 class CreateRiskDecisionView(APIView):
-    permission_classes = [IsAuthenticated, ]
+    # permission_classes = [IsAuthenticated, ]
     
     @swagger_auto_schema(request_body=RiskDecisionSerializer, tags = ['RiskDecision'])
     def post(self, request, *args, **kwargs):
@@ -350,7 +350,7 @@ class CreateRiskDecisionView(APIView):
         
         
 class RiskDecisionCRUDView(APIView):
-    permission_classes = [IsAuthenticated, ]
+    # permission_classes = [IsAuthenticated, ]
     
     @swagger_auto_schema(tags = ['RiskDecision'])
     def get(self, request, pk, *args, **kwargs):
@@ -404,7 +404,7 @@ class RiskDecisionCRUDView(APIView):
             
             
 class CreateMitigationView(APIView):
-    permission_classes = [IsAuthenticated, ]
+    # permission_classes = [IsAuthenticated, ]
     
     @swagger_auto_schema(request_body=MitigationSerializer, tags = ['Mitigation'])
     def post(self, request, *args, **kwargs):
@@ -431,7 +431,7 @@ class CreateMitigationView(APIView):
         
 
 class MitigationCRUDView(APIView):
-    permission_classes = [IsAuthenticated, ]
+    # permission_classes = [IsAuthenticated, ]
     
     @swagger_auto_schema(tags = ['Mitigation'])
     def get(self, request, pk, *args, **kwargs):
@@ -485,7 +485,7 @@ class MitigationCRUDView(APIView):
             
             
 class GetRiskMitigationView(APIView):
-    permission_classes = [IsAuthenticated, ]
+    # permission_classes = [IsAuthenticated, ]
     
     @swagger_auto_schema(tags = ['Filters'])
     def get(self, request, pk, *args, **kwargs):
@@ -498,7 +498,7 @@ class GetRiskMitigationView(APIView):
         
 
 class FilterRiskByStatusView(APIView):
-    permission_classes = [IsAuthenticated, ]
+    # permission_classes = [IsAuthenticated, ]
     
     @swagger_auto_schema(request_body=StatusSerializer, tags = ['Filters'])
     def post(self, request, *args, **kwargs):
@@ -517,7 +517,7 @@ class FilterRiskByStatusView(APIView):
             
             
 class UpcomingRiskAPIView(APIView):
-    permission_classes = [IsAuthenticated]
+    # permission_classes = [IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
         today = timezone.now()
