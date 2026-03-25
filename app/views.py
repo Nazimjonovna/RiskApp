@@ -18,9 +18,10 @@ class DepartmentView(APIView):
     def post(self, request, *args, **kwargs):
         serializer = DepartmentSerializer(data = request.data)
         if serializer.is_valid():
-            serializer.save()
+            instance = serializer.save()
             return Response({
                 "data":serializer.data,
+                "id":instance.id,
                 "status":status.HTTP_201_CREATED
             })
         else:

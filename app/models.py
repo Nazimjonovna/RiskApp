@@ -31,6 +31,7 @@ class Risk(models.Model):
         ("REPUTATIONAL", "Reputational"),
     ]
     title = models.CharField(max_length=255)
+    risk_number = models.CharField(max_length=20, unique=True, blank=True)
     description = models.TextField(blank=True)
     category = models.CharField(max_length=50, choices=CATEGORY_CHOICES)
     department = models.ForeignKey(
@@ -68,19 +69,14 @@ class Risk(models.Model):
     planned_controls_text = models.TextField(blank=True)
 
     def save(self, *args, **kwargs):
-        if not self.id:
-            last = Risk.objects.order_by("-created_at").first()
+        if not self.risk_number:
+            last = Risk.objects.order_by("-id").first()
             if last:
-                last_number = int(last.id.split("-")[1])
-                new_number = last_number + 1
+                new_number = last.id + 1
             else:
                 new_number = 1
-            self.id = f"RISK-{new_number:03d}"
-        mean_impact = (
-            self.impact_min +
-            self.impact_most_likely +
-            self.impact_max
-        ) / 3
+            self.risk_number = f"RISK-{new_number:03d}"
+        mean_impact = (self.impact_min + self.impact_most_likely + self.impact_max) / 3
         self.expected_loss = self.probability * mean_impact
         self.severity = self.expected_loss
         super().save(*args, **kwargs)
