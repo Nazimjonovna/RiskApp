@@ -73,7 +73,7 @@ class DepartmentCRUDView(APIView):
     def patch(self, request, pk, *args, **kwargs):
         department = Department.objects.filter(id =pk).first()
         if department:
-            serializer = DepartmentSerializer(intance = department, data = request.data, partial = True)
+            serializer = DepartmentSerializer(instance = department, data = request.data, partial = True)
             if serializer.is_valid():
                 serializer.save()
                 return Response({
@@ -151,7 +151,7 @@ class CategoryCRUDView(APIView):
     def patch(self, request, pk, *args, **kwargs):
         department = Category.objects.filter(id =pk).first()
         if department:
-            serializer = CategorySerializer(intance = department, data = request.data, partial = True)
+            serializer = CategorySerializer(instance = department, data = request.data, partial = True)
             if serializer.is_valid():
                 serializer.save()
                 return Response({
@@ -227,7 +227,7 @@ class RiskCRUDView(APIView):
     def patch(self, request, pk, *args, **kwargs):
         risk = Risk.objects.filter(id =pk).first()
         if risk:
-            serializer = RiskSerializer(intance = risk, data = request.data, partial = True)
+            serializer = RiskSerializer(instance = risk, data = request.data, partial = True)
             if serializer.is_valid():
                 serializer.save()
                 return Response({
@@ -303,7 +303,7 @@ class RiskActivityCRUDView(APIView):
     def patch(self, request, pk, *args, **kwargs):
         riskactivity = RiskActivity.objects.filter(id =pk).first()
         if riskactivity:
-            serializer = RiskActivitySerializer(intance = riskactivity, data = request.data, partial = True)
+            serializer = RiskActivitySerializer(instance = riskactivity, data = request.data, partial = True)
             if serializer.is_valid():
                 serializer.save()
                 return Response({
