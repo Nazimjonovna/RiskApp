@@ -14,6 +14,7 @@ class CategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Category
         fields = [
+            'id',
             "name",
         ]
         
@@ -22,6 +23,7 @@ class RiskSerializer(serializers.ModelSerializer):
     class Meta:
         model = Risk
         fields = [
+            'id',
             "title",
             "description",
             "category",
@@ -54,6 +56,7 @@ class RiskCommitteeSerializer(serializers.ModelSerializer):
     class Meta:
         model = RiskCommittee
         fields = [
+            'id',
             "last_decition",
             "last_decition_at",
             "risk",
@@ -64,6 +67,7 @@ class MitigationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Mitigation
         fields = [
+            'id',
             "risk",
             "title",
             "owner",
@@ -79,6 +83,7 @@ class RiskDecisionSerializer(serializers.ModelSerializer):
     class Meta:
         model = RiskDecition
         fields = [
+            'id',
             "risk",
             "decition_type",
             "decided_by",
@@ -91,6 +96,7 @@ class RiskActivitySerializer(serializers.ModelSerializer):
     class Meta:
         model = RiskActivity
         fields = [
+            'id',
             "risk",
             "type",
             "title",
