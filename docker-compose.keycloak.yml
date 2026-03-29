@@ -1,0 +1,25 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.5.6
+    container_name: keycloak
+    command: start-dev
+    
+    ports:
+      - "8080:8080"
+    
+    environment:
+      KC_DB: postgres
+      KC_DB_URL_HOST: riskapp-postgres
+      KC_DB_URL_DATABASE: keycloak_db
+      KC_DB_USERNAME: sa_keycloak
+      KC_DB_PASSWORD: "123123123Ke"
+
+      KEYCLOAK_ADMIN: riskapp_admin
+      KEYCLOAK_ADMIN_PASSWORD: "123123123$Ad"
+    
+    networks:
+      - riskapp-network
+
+networks:
+  riskapp-network:
+    external: true

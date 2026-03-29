@@ -3,13 +3,16 @@ from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from django.shortcuts import get_object_or_404
+from services.risk_activity import create_risk_activity_and_notify, add_user_to_risk_activity
+from services.notification import notify_risk_update, notify_mitigation_update, notify_mitigation_create
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from drf_yasg.utils import swagger_auto_schema
 from .serializers import (RiskActivitySerializer, RiskCommitteeSerializer, RiskDecisionSerializer,
                           RiskSerializer, MitigationSerializer, DepartmentSerializer, StatusSerializer,
-                          CategorySerializer)
+                          CategorySerializer, ReplyRiskActivitySerializer)
 from .models import (Department, Category,  Risk, RiskActivity, RiskCommittee, RiskDecition,
-                     Mitigation)
+                     Mitigation, ReplyRiskActivity)
 
 
 class DepartmentView(APIView):
@@ -171,19 +174,28 @@ class CategoryCRUDView(APIView):
 class CreateRiskView(APIView):
     # permission_classes = [IsAuthenticated, ]
     
-    @swagger_auto_schema(request_body=RiskSerializer, tags = ['Risk'])
+    @swagger_auto_schema(request_body=RiskSerializer, tags=['Risk'])
     def post(self, request, *args, **kwargs):
-        serializer = RiskSerializer(data = request.data)
+        serializer = RiskSerializer(data=request.data)
+
         if serializer.is_valid():
-            serializer.save()
+            risk = serializer.save()
+
+            create_risk_activity_and_notify(
+                risk=risk,
+                actor=risk.owner,     
+                action_type="CREATE",
+                notes="Risk created"
+            )
+
             return Response({
-                "data":serializer.data,
-                "status":status.HTTP_200_OK
+                "data": serializer.data,
+                "status": status.HTTP_200_OK
             })
-        else:
-            return Response({
-                "errors":serializer.errors
-            })
+
+        return Response({
+            "errors": serializer.errors
+        }, status=status.HTTP_400_BAD_REQUEST)
             
     @swagger_auto_schema(tags = ['Risk'])
     def get(self, request, *args, **kwargs):
@@ -227,9 +239,11 @@ class RiskCRUDView(APIView):
     def patch(self, request, pk, *args, **kwargs):
         risk = Risk.objects.filter(id =pk).first()
         if risk:
+            old_risk = Risk.objects.get(id=pk)
             serializer = RiskSerializer(instance = risk, data = request.data, partial = True)
             if serializer.is_valid():
-                serializer.save()
+                updated_risk = serializer.save()
+                notify_risk_update(old_risk, updated_risk)
                 return Response({
                     "data":serializer.data,
                     "status":status.HTTP_200_OK
@@ -243,6 +257,28 @@ class RiskCRUDView(APIView):
                 "status":status.HTTP_404_NOT_FOUND
             })
             
+            
+class RiskCloseView(APIView):
+    # permission_classes = [IsAuthenticated] #add permission only for risk.derector
+    
+    @swagger_auto_schema(tag = ['Risk'])
+    def get(self, request, pk, *args, **kwargs):
+        user = request.user
+        risk = Risk.objects.filter(id = pk).first()
+        if risk and user == risk.risk_derector:
+            risk.status = 'CLOSED'
+            risk.is_active = False
+            risk.save()
+            serializer = RiskSerializer(data = risk)
+            return Response({
+                "data":serializer.data,
+                'status':status.HTTP_200_OK
+            })
+        else:
+            return Response({
+                "status":status.HTTP_404_NOT_FOUND
+            })
+
 
 class CreateRiskActivityView(APIView):
     # permission_classes = [IsAuthenticated, ]
@@ -489,7 +525,8 @@ class CreateMitigationView(APIView):
     def post(self, request, *args, **kwargs):
         serialzier = MitigationSerializer(data = request.data)
         if serialzier.is_valid():
-            serialzier.save()
+            mitigation = serialzier.save()
+            notify_mitigation_create(mitigation)
             return Response({
                 "data":serialzier.data,
                 "status":status.HTTP_201_CREATED
@@ -545,9 +582,11 @@ class MitigationCRUDView(APIView):
     def patch(self, request, pk, *args, **kwargs):
         mitigation = Mitigation.objects.get(id = pk)
         if mitigation:
+            old_mitigation = Mitigation.objects.get(id=pk)
             serializer = MitigationSerializer(instance = mitigation, data = request.data, partial = True)
             if serializer.is_valid():
-                serializer.save()
+                updated_mitigation = serializer.save()
+                notify_mitigation_update(old_mitigation, updated_mitigation)
                 return Response({
                     "data":serializer.data,
                     "status":status.HTTP_201_CREATED
@@ -612,5 +651,188 @@ class UpcomingRiskAPIView(APIView):
                 "count": risks.count(),
                 "data": serializer.data
             },
+            status=status.HTTP_200_OK
+        )
+        
+        
+class ReplyRiskActivityCreateView(APIView):
+    # permission_classes = [IsAuthenticated]
+    
+    @swagger_auto_schema(request_body=ReplyRiskActivitySerializer, tag = ['ReplyRiskActivity'])
+    def post(self, request, *args, **kwargs):
+        serializer = ReplyRiskActivitySerializer(data = request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response({
+                "data":serializer.data,
+                "status":status.HTTP_201_CREATED
+            })
+        else:
+            return Response({
+                "errors":serializer.errors,
+                "status":status.HTTP_400_BAD_REQUEST
+            })
+        
+    @swagger_auto_schema(tag = ['ReplyRiskActivity'])        
+    def get(self, request, *args, **kwargs):
+        data = ReplyRiskActivity.objects.all()
+        serializer = ReplyRiskActivitySerializer(data, many=True)
+        return Response({
+            "data":serializer.data,
+            "status":status.HTTP_200_OK
+        })
+        
+        
+class ReplyRiskActivityCRUDView(APIView):
+    # permission_classes = [IsAuthenticated]
+    
+    @swagger_auto_schema(tag = ['ReplyRiskActivity'])
+    def get(self, request, pk, *args, **kwargs):
+        data1 = ReplyRiskActivity.objects.filter(id = pk).first()
+        if data1:
+            serializer = ReplyRiskActivitySerializer(data = data1)
+            return Response({
+                "data":serializer.data,
+                'status':status.HTTP_200_OK
+            })
+        else:
+            return Response({
+                "data":"Bunday ma'lumot topilmadi",
+                "status":status.HTTP_400_BAD_REQUEST
+            })
+            
+    @swagger_auto_schema(tag = ['ReplyRiskActivity'])
+    def delete(self, request, pk, *args, **kwargs):
+        data = ReplyRiskActivity.objects.filter(id = pk).first()
+        if data:
+            data.delete()
+            return Response({
+                "data":"Ma'lumot muvaffaqiyatli o'chirildi",
+                'status':status.HTTP_200_OK
+            })
+        else:
+            return Response({
+                "data":"Bunday ma'lumot topilmadi",
+                "status":status.HTTP_400_BAD_REQUEST
+            })
+            
+    @swagger_auto_schema(request_body=ReplyRiskActivitySerializer, tag = ['ReplyRiskActivity'])
+    def patch(self, request, pk, *args, **kwargs):
+        data1 = ReplyRiskActivity.objects.filter(id = pk).first()
+        if data1:
+            serializer = ReplyRiskActivitySerializer(instance = data1, data = request.data, partial = True)
+            if serializer.is_valid():
+                serializer.save()
+                return Response({
+                    "data":serializer.data,
+                    'status':status.HTTP_200_OK
+                })
+            else:
+                return Response({
+                    "errors":serializer.errors,
+                    'status':status.HTTP_400_BAD_REQUEST
+                })
+        else:
+            return Response({
+                "data":"Bunday ma'lumot topilmadi",
+                "status":status.HTTP_400_BAD_REQUEST
+            })
+            
+
+class AddRecipientToRiskView(APIView):
+    
+    @swagger_auto_schema(tags=["RiskActivity"])
+    def post(self, request, pk):
+        risk = get_object_or_404(Risk, pk=pk)
+        new_user = request.data.get("user")
+
+        if not new_user:
+            return Response(
+                {"error": "user field is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        recipient = add_user_to_risk_activity(
+            risk=risk,
+            new_user=new_user,
+            actor=request.user  
+        )
+
+        if not recipient:
+            return Response(
+                {"error": "RiskActivity not found for this risk"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        return Response(
+            {"message": f"{new_user} added to risk activity"},
+            status=status.HTTP_200_OK
+        )
+        
+        
+class UpdateRiskView(APIView):
+    
+    @swagger_auto_schema(request_body=RiskSerializer, tags=["Risk"])
+    def put(self, request, pk):
+        risk = get_object_or_404(Risk, pk=pk)
+        serializer = RiskSerializer(risk, data=request.data, partial=True)
+
+        if serializer.is_valid():
+            updated_risk = serializer.save()
+
+            create_risk_activity_and_notify(
+                risk=updated_risk,
+                actor=request.user,
+                action_type="UPDATE",
+                notes="Risk updated"
+            )
+
+            extra_users = request.data.get("extra_recipients", [])
+            for user in extra_users:
+                add_user_to_risk_activity(
+                    risk=updated_risk,
+                    new_user=user,
+                    actor=request.user
+                )
+
+            return Response(
+                {"data": serializer.data},
+                status=status.HTTP_200_OK
+            )
+
+        return Response(
+            {"errors": serializer.errors},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+        
+        
+class AssignRiskView(APIView):
+    
+    @swagger_auto_schema(tags=["Risk"])
+    def post(self, request, pk):
+        risk = get_object_or_404(Risk, pk=pk)
+        assigned_user = request.data.get("user")
+
+        if not assigned_user:
+            return Response(
+                {"error": "user field is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        add_user_to_risk_activity(
+            risk=risk,
+            new_user=assigned_user,
+            actor=request.user
+        )
+
+        create_risk_activity_and_notify(
+            risk=risk,
+            actor=request.user,
+            action_type="ASSIGNMENT",
+            notes=f"{assigned_user} assigned to risk"
+        )
+
+        return Response(
+            {"message": f"{assigned_user} assigned and notified"},
             status=status.HTTP_200_OK
         )
