@@ -3,6 +3,8 @@ from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+import requests
+from django.conf import settings
 from django.shortcuts import get_object_or_404
 from .services.risk_activity import create_risk_activity_and_notify, add_user_to_risk_activity
 from .services.notification import notify_risk_update, notify_mitigation_update, notify_mitigation_create
@@ -11,7 +13,7 @@ from .permissions import IsTopManager
 from drf_yasg.utils import swagger_auto_schema
 from .serializers import (RiskActivitySerializer, RiskCommitteeSerializer, RiskDecisionSerializer,
                           RiskSerializer, MitigationSerializer, DepartmentSerializer, StatusSerializer,
-                          CategorySerializer, ReplyRiskActivitySerializer)
+                          CategorySerializer, ReplyRiskActivitySerializer, UserSerializer)
 from .models import (Department, Category,  Risk, RiskActivity, RiskCommittee, RiskDecition,
                      Mitigation, ReplyRiskActivity)
 
@@ -895,40 +897,66 @@ class AssignRiskView(APIView):
             {"message": f"{assigned_user} assigned and notified"},
             status=status.HTTP_200_OK
         )
-
-
-from rest_framework.exceptions import AuthenticationFailed
-from django.contrib.auth import authenticate
-import requests
-from django.conf import settings
-from .auth import KeycloakAuthentication
+        
+        
 
 class GetTokenView(APIView):
+    """
+    Frontend bu endpoint'ni ishlatmaydi — to'g'ridan-to'g'ri
+    Keycloak'dan token oladi. Bu faqat test/debug uchun.
+    """
     authentication_classes = []
     permission_classes = []
 
     def post(self, request):
+        username = request.data.get("username")
+        password = request.data.get("password")
+
+        if not username or not password:
+            return Response(
+                {"error": "username va password majburiy"},
+                status=400
+            )
+
         data = {
             "grant_type": "password",
             "client_id": settings.KEYCLOAK_CLIENT_ID,
             "client_secret": settings.KEYCLOAK_CLIENT_SECRET,
-            "username": request.data.get("username"),
-            "password": request.data.get("password"),
+            "username": username,
+            "password": password,
         }
 
-        response = requests.post(settings.KEYCLOAK_TOKEN_URL, data=data)
+        try:
+            response = requests.post(
+                settings.KEYCLOAK_TOKEN_URL,
+                data=data,
+                timeout=10
+            )
+        except requests.RequestException as e:
+            return Response(
+                {"error": f"Keycloak server'ga ulanib bo'lmadi: {str(e)}"},
+                status=503
+            )
+
+        # Keycloak xatolik qaytarsa
+        if response.status_code != 200:
+            return Response(
+                {"error": "Login muvaffaqiyatsiz", "detail": response.json()},
+                status=response.status_code
+            )
 
         return Response(response.json())
 
 
-# 🔥 2. TOKEN BILAN USER INFO
 class MeView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        auth = request.auth or {}  # None bo'lsa bo'sh dict
-        return Response({
-            "username": request.user.username,
-            "email": auth.get("email") or getattr(request.user, "email", None),
-            "full_name": auth.get("name") or getattr(request.user, "get_full_name", lambda: None)(),
-        })
+        user = request.user
+        payload = request.auth or {}
+        user_data = UserSerializer(user).data
+        # Keycloak'dan kelgan qo'shimcha ma'lumotlar
+        user_data["roles"] = payload.get("realm_access", {}).get("roles", [])
+        user_data["keycloak_id"] = payload.get("sub")
+
+        return Response(user_data)

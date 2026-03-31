@@ -1,6 +1,34 @@
 from rest_framework import serializers
 from .models import (Department, Risk, RiskCommittee, Mitigation, 
                      RiskDecition, RiskActivity, Category, ReplyRiskActivity)
+from rest_framework import serializers
+from django.contrib.auth.models import User
+
+
+class UserSerializer(serializers.ModelSerializer):
+    full_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            "id",
+            "username",
+            "email",
+            "first_name",
+            "last_name",
+            "full_name",
+            "is_staff",
+            "is_active",
+            "is_superuser",
+            "date_joined",
+            "last_login",
+        ]
+        # Parol va xavfsiz fieldlarni hech qachon qaytarmaymiz
+        read_only_fields = fields
+
+    def get_full_name(self, obj):
+        return obj.get_full_name()
+
 
 class DepartmentSerializer(serializers.ModelSerializer):
     class Meta:

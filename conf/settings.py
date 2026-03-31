@@ -32,18 +32,30 @@ DEBUG = True
 ALLOWED_HOSTS = ['*']
 
 # Keycloak config
-KEYCLOAK_SERVER_URL = os.getenv("OIDC_SERVER_URL")
-KEYCLOAK_REALM = os.getenv("OIDC_REALM")
+KEYCLOAK_SERVER_URL = os.getenv("OIDC_SERVER_URL", "http://localhost:8080")
+KEYCLOAK_REALM = os.getenv("OIDC_REALM", "risk-management-system")
 KEYCLOAK_CLIENT_ID = os.getenv("OIDC_RP_CLIENT_ID")
 KEYCLOAK_CLIENT_SECRET = os.getenv("OIDC_RP_CLIENT_SECRET")
 
-KEYCLOAK_TOKEN_URL = f"{KEYCLOAK_SERVER_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token"
-KEYCLOAK_USERINFO_URL = f"{KEYCLOAK_SERVER_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/userinfo"
-KEYCLOAK_JWKS_URL = f"{KEYCLOAK_SERVER_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/certs"
+KEYCLOAK_TOKEN_URL = (
+    f"{KEYCLOAK_SERVER_URL}/realms/{KEYCLOAK_REALM}"
+    f"/protocol/openid-connect/token"
+)
+KEYCLOAK_USERINFO_URL = (
+    f"{KEYCLOAK_SERVER_URL}/realms/{KEYCLOAK_REALM}"
+    f"/protocol/openid-connect/userinfo"
+)
+KEYCLOAK_JWKS_URL = (
+    f"{KEYCLOAK_SERVER_URL}/realms/{KEYCLOAK_REALM}"
+    f"/protocol/openid-connect/certs"
+)
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "app.auth.KeycloakAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
     ],
 }
 
