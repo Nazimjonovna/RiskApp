@@ -28,6 +28,7 @@ schema_view = get_schema_view(
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('app/', include('app.urls')),
+    path('oidc/', include('mozilla_django_oidc.urls')),
 ]
 
 

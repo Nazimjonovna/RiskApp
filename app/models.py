@@ -73,7 +73,7 @@ class Risk(models.Model):
     created_by_user_id = models.CharField(max_length=100)
     created_by_department_id = models.CharField(max_length=100)
     status = models.CharField(
-        max_length=20,
+        max_length=2000,
         choices=STATUS_CHOICES,
         default="OPEN"
     )
