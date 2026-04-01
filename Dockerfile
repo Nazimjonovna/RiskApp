@@ -16,11 +16,9 @@ RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
 COPY . .
-
-# Static fayllarni collect qilish
-# Static fayllarni collect qilish
-RUN DJANGO_SETTINGS_MODULE=conf.settings python manage.py collectstatic --noinput
+RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 8000
 
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["gunicorn", "conf.wsgi:application", "--bind", "0.0.0.0:8000"]

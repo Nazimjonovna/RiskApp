@@ -1,11 +1,12 @@
-import uuid
 from django.db import models
-from django.core.validators import MinValueValidator, MaxValueValidator
 from django.utils import timezone
 
 
 class Department(models.Model):
     name = models.CharField(max_length=255)
+    keycloak_group_id = models.CharField(max_length=255, unique=True, null=True, blank=True)
+    keycloak_path = models.CharField(max_length=500, unique=True, null=True, blank=True)
+    is_active = models.BooleanField(default=True)
 
     def __str__(self):
         return self.name
@@ -97,9 +98,6 @@ class Risk(models.Model):
             else:
                 new_number = 1
             self.risk_number = f"RISK-{new_number:03d}"
-        mean_impact = (self.impact_min + self.impact_most_likely + self.impact_max) / 3
-        self.expected_loss = self.probability * mean_impact
-        self.severity = self.expected_loss
         super().save(*args, **kwargs)
 
     def __str__(self):

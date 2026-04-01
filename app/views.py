@@ -14,6 +14,12 @@ from drf_yasg.utils import swagger_auto_schema
 from .serializers import (RiskActivitySerializer, RiskCommitteeSerializer, RiskDecisionSerializer,
                           RiskSerializer, MitigationSerializer, DepartmentSerializer, StatusSerializer,
                           CategorySerializer, ReplyRiskActivitySerializer, UserSerializer)
+from .services.keycloak_departments import (
+    DepartmentResolutionError,
+    get_user_group_paths,
+    resolve_user_department,
+    sync_departments_from_keycloak,
+)
 from .models import (Department, Category,  Risk, RiskActivity, RiskCommittee, RiskDecition,
                      Mitigation, ReplyRiskActivity)
 
@@ -37,7 +43,15 @@ class DepartmentView(APIView):
             
     @swagger_auto_schema(tags = ['Department'])
     def get(self, request, *args,**kwargs):
-        departments = Department.objects.all()
+        try:
+            departments = sync_departments_from_keycloak()
+        except Exception:
+            departments = Department.objects.filter(
+                is_active=True,
+                keycloak_path__isnull=False,
+            ).order_by("name")
+            if not departments.exists():
+                departments = Department.objects.filter(is_active=True).order_by("name")
         serializer = DepartmentSerializer(departments, many = True)
         return Response({
             "data":serializer.data,
@@ -179,7 +193,7 @@ class CreateRiskView(APIView):
     
     @swagger_auto_schema(request_body=RiskSerializer, tags=['Risk'])
     def post(self, request, *args, **kwargs):
-        serializer = RiskSerializer(data=request.data)
+        serializer = RiskSerializer(data=request.data, context={"request": request})
 
         if serializer.is_valid():
             risk = serializer.save()
@@ -243,7 +257,12 @@ class RiskCRUDView(APIView):
         risk = Risk.objects.filter(id =pk).first()
         if risk:
             old_risk = Risk.objects.get(id=pk)
-            serializer = RiskSerializer(instance = risk, data = request.data, partial = True)
+            serializer = RiskSerializer(
+                instance=risk,
+                data=request.data,
+                partial=True,
+                context={"request": request},
+            )
             if serializer.is_valid():
                 updated_risk = serializer.save()
                 notify_risk_update(old_risk, updated_risk)
@@ -270,7 +289,12 @@ class UserRiskCrudView(APIView):
         if risk:
             old_risk = Risk.objects.get(id=pk)
             if old_risk.status == "DRAFT":
-                serializer = RiskSerializer(instance = risk, data = request.data, partial = True)
+                serializer = RiskSerializer(
+                    instance=risk,
+                    data=request.data,
+                    partial=True,
+                    context={"request": request},
+                )
                 if serializer.is_valid():
                     updated_risk = serializer.save()
                     notify_risk_update(old_risk, updated_risk)
@@ -836,7 +860,12 @@ class UpdateRiskView(APIView):
     @swagger_auto_schema(request_body=RiskSerializer, tags=["Risk"])
     def put(self, request, pk):
         risk = get_object_or_404(Risk, pk=pk)
-        serializer = RiskSerializer(risk, data=request.data, partial=True)
+        serializer = RiskSerializer(
+            risk,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
 
         if serializer.is_valid():
             updated_risk = serializer.save()
@@ -958,5 +987,19 @@ class MeView(APIView):
         # Keycloak'dan kelgan qo'shimcha ma'lumotlar
         user_data["roles"] = payload.get("realm_access", {}).get("roles", [])
         user_data["keycloak_id"] = payload.get("sub")
+        user_data["groups"] = get_user_group_paths(payload)
+
+        try:
+            department = resolve_user_department(payload, sync=True)
+            user_data["department_id"] = department.id if department else None
+            user_data["department_name"] = department.name if department else None
+            user_data["department"] = (
+                DepartmentSerializer(department).data if department else None
+            )
+        except DepartmentResolutionError as exc:
+            user_data["department_id"] = None
+            user_data["department_name"] = None
+            user_data["department"] = None
+            user_data["department_error"] = str(exc)
 
         return Response(user_data)
