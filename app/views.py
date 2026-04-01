@@ -9,7 +9,7 @@ from django.shortcuts import get_object_or_404
 from .services.risk_activity import create_risk_activity_and_notify, add_user_to_risk_activity
 from .services.notification import notify_risk_update, notify_mitigation_update, notify_mitigation_create
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from .permissions import IsTopManager
+from .permissions import IsReadOnlyOrTopManager, IsTopManager
 from drf_yasg.utils import swagger_auto_schema
 from .serializers import (RiskActivitySerializer, RiskCommitteeSerializer, RiskDecisionSerializer,
                           RiskSerializer, MitigationSerializer, DepartmentSerializer, StatusSerializer,
@@ -111,7 +111,7 @@ class DepartmentCRUDView(APIView):
             
             
 class CategoryView(APIView):
-    permission_classes = [IsAuthenticated, IsTopManager]
+    permission_classes = [IsAuthenticated, IsReadOnlyOrTopManager]
     
     @swagger_auto_schema(request_body=CategorySerializer, tags = ['Category'])
     def post(self, request, *args, **kwargs):
@@ -138,7 +138,7 @@ class CategoryView(APIView):
         
 
 class CategoryCRUDView(APIView):
-    permission_classes = [IsAuthenticated, IsTopManager] # keyinchalik faqat risk role dagila qo'sha oladigan permission beramiz
+    permission_classes = [IsAuthenticated, IsReadOnlyOrTopManager] # keyinchalik faqat risk role dagila qo'sha oladigan permission beramiz
     
     @swagger_auto_schema(tags = ['Category'])
     def get(self, request, pk, *args, **kwargs):
@@ -578,7 +578,7 @@ class RiskDecitionCRUDView(APIView):
             
             
 class CreateMitigationView(APIView):
-    permission_classes = [IsAuthenticated, IsTopManager]
+    permission_classes = [IsAuthenticated, IsReadOnlyOrTopManager]
     
     @swagger_auto_schema(request_body=MitigationSerializer, tags = ['Mitigation'])
     def post(self, request, *args, **kwargs):
@@ -606,7 +606,7 @@ class CreateMitigationView(APIView):
         
 
 class MitigationCRUDView(APIView):
-    permission_classes = [IsAuthenticated, IsTopManager]
+    permission_classes = [IsAuthenticated, IsReadOnlyOrTopManager]
     
     @swagger_auto_schema(tags = ['Mitigation'])
     def get(self, request, pk, *args, **kwargs):

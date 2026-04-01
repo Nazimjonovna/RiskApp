@@ -38,6 +38,23 @@ class IsTopManager(BasePermission):
         return "Top-manager" in roles
 
 
+class IsReadOnlyOrTopManager(BasePermission):
+    """
+    Barcha authenticated foydalanuvchilar GET/HEAD/OPTIONS qila oladi.
+    O'zgartirishlar esa faqat Top-manager uchun.
+    """
+
+    def has_permission(self, request, view):
+        if not request.auth:
+            return False
+
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return True
+
+        roles = request.auth.get("realm_access", {}).get("roles", [])
+        return "Top-manager" in roles
+
+
 class IsOfflineAccess(BasePermission):
     def has_permission(self, request, view):
         if not request.auth:
