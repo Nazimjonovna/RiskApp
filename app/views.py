@@ -392,6 +392,17 @@ def _advance_risk_to_committee_review_2_if_ready(risk, actor):
     )
 
 
+def _all_mitigation_actions_approved(risk):
+    mitigations = list(risk.mitigations.all())
+    if not mitigations:
+        return False
+
+    return all(
+        _normalize_status_token(mitigation.status) == MITIGATION_APPROVED_STATUS
+        for mitigation in mitigations
+    )
+
+
 class DepartmentView(APIView):
     permission_classes = [IsAuthenticated, IsReadOnlyOrSuperAdmin]
     
@@ -644,13 +655,28 @@ class RiskCRUDView(APIView):
                     "responsible_department_id",
                     "due_date",
                     "last_reviewed_at",
+                    "status",
                 }
                 requested_fields = set(request.data.keys())
-                allowed = (
+                requested_status = _normalize_status_token(payload_data.get("status"))
+                director_controls_own_risk = (
                     requested_fields.issubset(director_editable_fields)
                     and _is_risk_related_department_director(request, risk)
+                )
+
+                director_can_assign = (
+                    director_controls_own_risk
+                    and "status" not in requested_fields
                     and _normalize_status_token(risk.status) in DIRECTOR_ASSIGNABLE_RISK_STATUSES
                 )
+                director_can_send_to_committee = (
+                    director_controls_own_risk
+                    and requested_fields.issubset({"status", "last_reviewed_at"})
+                    and requested_status == "COMMITTEE_REVIEW_2"
+                    and _normalize_status_token(risk.status) in MITIGATION_STAGE_RISK_STATUSES
+                    and _all_mitigation_actions_approved(risk)
+                )
+                allowed = director_can_assign or director_can_send_to_committee
                 if allowed:
                     try:
                         request_department = resolve_user_department(request.auth or {}, sync=False)
@@ -1142,6 +1168,12 @@ class MitigationCRUDView(APIView):
                     "status": status.HTTP_400_BAD_REQUEST,
                 }, status=status.HTTP_400_BAD_REQUEST)
 
+            if requested_status == "NOT_STARTED" and _normalize_status_token(mitigation.status) != "NOT_STARTED":
+                return Response({
+                    "detail": "A mitigation action cannot be moved back to Not Started after work has begun.",
+                    "status": status.HTTP_400_BAD_REQUEST,
+                }, status=status.HTTP_400_BAD_REQUEST)
+
             if is_dept_director and requested_status == MITIGATION_APPROVED_STATUS:
                 return Response({
                     "detail": "Department directors cannot approve mitigation actions.",
@@ -1174,7 +1206,6 @@ class MitigationCRUDView(APIView):
                         "Mitigation action approved",
                         notes=str(request.data.get("notes", "") or "").strip(),
                     )
-                    _advance_risk_to_committee_review_2_if_ready(updated_mitigation.risk, actor)
                 elif is_risk_dept and requested_status == "IN_PROGRESS" and _normalize_status_token(old_mitigation.status) == MITIGATION_REVIEWABLE_STATUS:
                     _ensure_mitigation_risk_in_progress(
                         updated_mitigation,
@@ -1234,6 +1265,11 @@ class StaffRiskMitigationCRYDView(APIView):
                 }, status=status.HTTP_400_BAD_REQUEST)
 
             requested_status = _normalize_status_token(request.data.get("status"))
+            if requested_status == "NOT_STARTED" and _normalize_status_token(mitigation.status) != "NOT_STARTED":
+                return Response({
+                    "detail": "A mitigation action cannot be moved back to Not Started after work has begun.",
+                    "status": status.HTTP_400_BAD_REQUEST,
+                }, status=status.HTTP_400_BAD_REQUEST)
             if requested_status and requested_status not in MITIGATION_PERFORMER_EDITABLE_STATUSES | {MITIGATION_REVIEWABLE_STATUS}:
                 return Response({
                     "detail": "Assigned staff can only move mitigation actions to In Progress or Pending Risk Review.",
