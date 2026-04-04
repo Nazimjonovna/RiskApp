@@ -1,4 +1,5 @@
 from datetime import timedelta
+import re
 from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -51,6 +52,32 @@ MITIGATION_PERFORMER_EDITABLE_STATUSES = {
 MITIGATION_REVIEWABLE_STATUS = "PENDING_RISK_REVIEW"
 MITIGATION_APPROVED_STATUS = "APPROVED"
 
+DEPARTMENT_ALIASES = {
+    "accounting": {"accounting", "бухгалтерия"},
+    "aup": {"aup", "департамент по стратегическим проектам"},
+    "billing_operations": {"billing_operations", "операционный департамент"},
+    "chancellery": {"chancellery", "отдел делопроизводства"},
+    "commerce": {"commerce", "коммерческий департамент"},
+    "compliance": {"compliance", "внутренний контроль и комплаенс", "департамент комплаенс"},
+    "finance": {"finance", "финансовый департамент", "финансовый департамент и фин контроль"},
+    "hr": {"hr", "human resources", "департамент управления персоналом", "департамент персонала"},
+    "ib": {"ib", "департамент обеспечения информационной безопасности", "департамент иб"},
+    "it": {"it", "it and security", "it & security", "департамент ит", "департамент информационных технологий"},
+    "it_app_razrab": {"it_app_razrab", "департамент по разработке программных решений"},
+    "it_vnedreniye": {"it_vnedreniye"},
+    "legal": {"legal", "юридический департамент"},
+    "managerial": {"managerial", "административный департамент"},
+    "marketing_pr": {"marketing_pr", "департамент маркетинга и продвижения"},
+    "nabsovet": {"nabsovet", "аппарат наблюдательного совета"},
+    "pm": {"pm", "департамент по разработке и развитию продуктов"},
+    "purchasing": {"purchasing", "procurement", "департамент управления закупками", "департамент закупок"},
+    "regional": {"regional", "отдел по работе с зарплатными проектами и региональными сотрудниками"},
+    "risk": {"risk", "департамент управления рисками"},
+    "securityaho": {"securityaho", "департамент физической безопасности"},
+    "students": {"students", "департамент работы со стажёрами"},
+    "ucmg": {"ucmg"},
+}
+
 
 def _normalize_identity_value(value):
     return str(value or "").strip().lower()
@@ -58,6 +85,36 @@ def _normalize_identity_value(value):
 
 def _normalize_status_token(value):
     return str(value or "").strip().upper().replace(" ", "_").replace("-", "_")
+
+
+def _sanitize_department_value(value):
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if "/" in text:
+        text = text.rsplit("/", 1)[-1]
+    text = text.replace("&", " and ")
+    text = re.sub(r"[\"'`]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+_SANITIZED_DEPARTMENT_ALIASES = {
+    canonical: {_sanitize_department_value(canonical), *{_sanitize_department_value(alias) for alias in aliases}}
+    for canonical, aliases in DEPARTMENT_ALIASES.items()
+}
+
+
+def _canonical_department_key(value):
+    normalized = _sanitize_department_value(value)
+    if not normalized:
+        return ""
+
+    for canonical, aliases in _SANITIZED_DEPARTMENT_ALIASES.items():
+        if normalized in aliases:
+            return canonical
+
+    return normalized
 
 
 def _request_identity_candidates(request):
@@ -143,11 +200,15 @@ def _request_department_candidates(request):
     if department:
         values.extend(_department_identity_candidates(department))
 
-    return {
-        _normalize_identity_value(value)
-        for value in values
-        if _normalize_identity_value(value)
-    }
+    candidates = set()
+    for value in values:
+        normalized = _normalize_identity_value(value)
+        canonical = _canonical_department_key(value)
+        if normalized:
+            candidates.add(normalized)
+        if canonical:
+            candidates.add(canonical)
+    return candidates
 
 
 def _department_identity_candidates(department):
@@ -160,11 +221,15 @@ def _department_identity_candidates(department):
     if keycloak_path:
         values.append(keycloak_path.rsplit("/", 1)[-1])
 
-    return {
-        _normalize_identity_value(value)
-        for value in values
-        if _normalize_identity_value(value)
-    }
+    candidates = set()
+    for value in values:
+        normalized = _normalize_identity_value(value)
+        canonical = _canonical_department_key(value)
+        if normalized:
+            candidates.add(normalized)
+        if canonical:
+            candidates.add(canonical)
+    return candidates
 
 
 def _is_risk_related_department_director(request, risk):
@@ -550,7 +615,9 @@ class RiskCRUDView(APIView):
     def patch(self, request, pk, *args, **kwargs):
         risk = Risk.objects.filter(id =pk).first()
         if risk:
+            payload_data = request.data.copy()
             allowed = has_any_logical_role(request, ["risk-dept", "risk-committee"])
+            request_department = None
 
             if not allowed and has_logical_role(request, "dept-director"):
                 director_editable_fields = {
@@ -565,6 +632,11 @@ class RiskCRUDView(APIView):
                     and _is_risk_related_department_director(request, risk)
                     and _normalize_status_token(risk.status) in MITIGATION_STAGE_RISK_STATUSES
                 )
+                if allowed:
+                    try:
+                        request_department = resolve_user_department(request.auth or {}, sync=False)
+                    except DepartmentResolutionError:
+                        request_department = None
 
             if not allowed:
                 return Response({
@@ -572,10 +644,13 @@ class RiskCRUDView(APIView):
                     "status": status.HTTP_403_FORBIDDEN,
                 }, status=status.HTTP_403_FORBIDDEN)
 
+            if request_department and "responsible" in payload_data and "responsible_department_id" not in payload_data:
+                payload_data["responsible_department_id"] = request_department.id
+
             old_risk = Risk.objects.get(id=pk)
             serializer = RiskSerializer(
                 instance=risk,
-                data=request.data,
+                data=payload_data,
                 partial=True,
                 context={"request": request},
             )
@@ -1124,9 +1199,12 @@ class StaffRiskMitigationCRYDView(APIView):
     def patch(self, request, pk, *args, **kwargs):
         mitigation = Mitigation.objects.select_related("risk", "risk__responsible_department_id", "risk__department").get(id = pk)
         if mitigation:
-            if not _is_mitigation_owner(request, mitigation):
+            is_owner = _is_mitigation_owner(request, mitigation)
+            is_dept_director = _is_mitigation_department_director(request, mitigation)
+
+            if not is_owner and not is_dept_director:
                 return Response({
-                    "detail": "Only the assigned mitigation owner can update this action.",
+                    "detail": "Only the assigned mitigation owner or the mitigation department director can update this action.",
                     "status": status.HTTP_403_FORBIDDEN,
                 }, status=status.HTTP_403_FORBIDDEN)
 
@@ -1609,4 +1687,3 @@ class DepartmentMemberDirectoryView(APIView):
             "data": directory_members,
             "status": status.HTTP_200_OK,
         })
-
