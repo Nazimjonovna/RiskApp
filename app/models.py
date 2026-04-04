@@ -1,18 +1,101 @@
+import re
+
 from django.db import models
 from django.utils import timezone
 
 
+CYRILLIC_TO_LATIN = str.maketrans(
+    {
+        "А": "A", "Б": "B", "В": "V", "Г": "G", "Д": "D", "Е": "E", "Ё": "E",
+        "Ж": "ZH", "З": "Z", "И": "I", "Й": "Y", "К": "K", "Л": "L", "М": "M",
+        "Н": "N", "О": "O", "П": "P", "Р": "R", "С": "S", "Т": "T", "У": "U",
+        "Ф": "F", "Х": "H", "Ц": "TS", "Ч": "CH", "Ш": "SH", "Щ": "SCH",
+        "Ъ": "", "Ы": "Y", "Ь": "", "Э": "E", "Ю": "YU", "Я": "YA",
+        "а": "A", "б": "B", "в": "V", "г": "G", "д": "D", "е": "E", "ё": "E",
+        "ж": "ZH", "з": "Z", "и": "I", "й": "Y", "к": "K", "л": "L", "м": "M",
+        "н": "N", "о": "O", "п": "P", "р": "R", "с": "S", "т": "T", "у": "U",
+        "ф": "F", "х": "H", "ц": "TS", "ч": "CH", "ш": "SH", "щ": "SCH",
+        "ъ": "", "ы": "Y", "ь": "", "э": "E", "ю": "YU", "я": "YA",
+        "Қ": "Q", "қ": "Q", "Ғ": "G", "ғ": "G", "Ҳ": "H", "ҳ": "H",
+        "Ў": "O", "ў": "O",
+    }
+)
+
+
+def _sanitize_code(value):
+    transliterated = (value or "").translate(CYRILLIC_TO_LATIN).upper()
+    return re.sub(r"[^A-Z0-9]", "", transliterated)
+
+
+def _base_business_code(value, default, max_length=6):
+    transliterated = (value or "").translate(CYRILLIC_TO_LATIN).upper()
+    tokens = re.findall(r"[A-Z0-9]+", transliterated)
+    if not tokens:
+        return default[:max_length]
+
+    if len(tokens) >= 2:
+        initials = "".join(token[0] for token in tokens[:3])
+        if len(initials) >= 2:
+            return initials[:max_length]
+
+    cleaned = "".join(tokens)
+    if len(cleaned) <= max_length:
+        return cleaned
+
+    return cleaned[: min(3, max_length)]
+
+
+def _unique_business_code(model_cls, source, default, current_pk=None, max_length=6):
+    base = _base_business_code(source, default=default, max_length=max_length)
+    candidate = base
+    suffix = 2
+
+    while model_cls.objects.filter(code=candidate).exclude(pk=current_pk).exists():
+        suffix_text = str(suffix)
+        candidate = f"{base[:max_length - len(suffix_text)]}{suffix_text}"
+        suffix += 1
+
+    return candidate
+
+
 class Department(models.Model):
     name = models.CharField(max_length=255)
+    code = models.CharField(max_length=6, unique=True, null=True, blank=True)
     keycloak_group_id = models.CharField(max_length=255, unique=True, null=True, blank=True)
     keycloak_path = models.CharField(max_length=500, unique=True, null=True, blank=True)
     is_active = models.BooleanField(default=True)
+
+    def save(self, *args, **kwargs):
+        if self.code:
+            self.code = _sanitize_code(self.code)[:6] or None
+        if not self.code:
+            source = (self.keycloak_path or "").rstrip("/").split("/")[-1] or self.name
+            self.code = _unique_business_code(
+                self.__class__,
+                source=source,
+                default="DEP",
+                current_pk=self.pk,
+            )
+        return super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
 
 class Category(models.Model):
     name = models.CharField(max_length=255)
+    code = models.CharField(max_length=6, unique=True, null=True, blank=True)
+
+    def save(self, *args, **kwargs):
+        if self.code:
+            self.code = _sanitize_code(self.code)[:6] or None
+        if not self.code:
+            self.code = _unique_business_code(
+                self.__class__,
+                source=self.name,
+                default="CAT",
+                current_pk=self.pk,
+            )
+        return super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
@@ -51,7 +134,7 @@ class Risk(models.Model):
         ('CRITICAL', 'Critical')
     ]
     title = models.CharField(max_length=255)
-    risk_number = models.CharField(max_length=20, unique=True, blank=True)
+    risk_number = models.CharField(max_length=24, unique=True, blank=True)
     description = models.TextField(blank=True)
     department = models.ForeignKey(
         Department,
@@ -90,15 +173,44 @@ class Risk(models.Model):
     existing_controls_text = models.TextField(blank=True)
     planned_controls_text = models.TextField(blank=True)
 
+    @staticmethod
+    def _format_code(value, width):
+        if not value:
+            return "0" * width
+        return f"{int(value):0{width}d}"
+
+    @staticmethod
+    def _segment_code(value, numeric_fallback, fallback_width):
+        segment = _sanitize_code(value)[:6]
+        if segment:
+            return segment
+        return Risk._format_code(numeric_fallback, fallback_width)
+
+    def build_risk_number(self):
+        category = self.category
+        department = self.department or self.responsible_department_id
+        department_pk = self.department_id or self.responsible_department_id_id
+        category_code = self._segment_code(
+            getattr(category, "code", None),
+            self.category_id,
+            2,
+        )
+        department_code = self._segment_code(
+            getattr(department, "code", None),
+            department_pk,
+            2,
+        )
+        sequence_code = self._format_code(self.pk, 3)
+        return f"R-{category_code}-{department_code}-{sequence_code}"
+
     def save(self, *args, **kwargs):
-        if not self.risk_number:
-            last = Risk.objects.order_by("-id").first()
-            if last:
-                new_number = last.id + 1
-            else:
-                new_number = 1
-            self.risk_number = f"RISK-{new_number:03d}"
+        creating_without_number = self._state.adding and not self.risk_number
+        if not creating_without_number:
+            return super().save(*args, **kwargs)
+
         super().save(*args, **kwargs)
+        self.risk_number = self.build_risk_number()
+        return super().save(update_fields=["risk_number"])
 
     def __str__(self):
         return f"{self.id} - {self.title}"

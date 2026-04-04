@@ -37,6 +37,7 @@ class DepartmentSerializer(serializers.ModelSerializer):
         fields = [
             'id',
             "name",
+            "code",
         ]
         
 
@@ -46,6 +47,7 @@ class CategorySerializer(serializers.ModelSerializer):
         fields = [
             'id',
             "name",
+            "code",
         ]
         
 
