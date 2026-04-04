@@ -183,6 +183,38 @@ def _fetch_user_groups(user_id):
     return _flatten_groups(response.json())
 
 
+def _fetch_group_members(group_id):
+    members = []
+    first = 0
+    batch_size = 200
+
+    while True:
+        try:
+            response = requests.get(
+                f"{settings.KEYCLOAK_ADMIN_BASE_URL}/groups/{group_id}/members",
+                params={"briefRepresentation": "false", "first": first, "max": batch_size},
+                headers=_admin_headers(),
+                timeout=15,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise DepartmentResolutionError(
+                "Failed to fetch department members from Keycloak Admin API."
+            ) from exc
+
+        batch = response.json()
+        if not batch:
+            break
+
+        members.extend(batch)
+        if len(batch) < batch_size:
+            break
+
+        first += batch_size
+
+    return members
+
+
 def _department_groups(groups):
     prefix = _normalize_group_path(settings.KEYCLOAK_DEPARTMENT_GROUP_PATH_PREFIX)
     if not prefix:

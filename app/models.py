@@ -108,7 +108,8 @@ class Mitigation(models.Model):
     STATUS_CHOICES = [
         ("NOT_STARTED", "Not Started"),
         ("IN_PROGRESS", "In Progress"),
-        ("DONE", "Done"),
+        ("PENDING_RISK_REVIEW", "Pending Risk Review"),
+        ("APPROVED", "Approved"),
     ]
     risk = models.ForeignKey(
         "Risk",
