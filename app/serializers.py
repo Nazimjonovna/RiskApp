@@ -119,6 +119,14 @@ class MitigationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Mitigation
         fields = "__all__"
+        read_only_fields = (
+            "department_director",
+            "created_by",
+            "completed_by",
+            "completed_at",
+            "created_at",
+            "updated_at",
+        )
         
         
 class RiskDecisionSerializer(serializers.ModelSerializer):

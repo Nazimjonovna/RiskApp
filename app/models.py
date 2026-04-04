@@ -231,6 +231,9 @@ class Mitigation(models.Model):
     department_director = models.CharField(max_length=500)
     title = models.CharField(max_length=255)
     owner = models.CharField(max_length=200) # keycloak va ad qo'shilganda foreginkey, bu mitigation ni qilishi kk bo'lgan odam
+    created_by = models.CharField(max_length=200, blank=True, default="")
+    completed_by = models.CharField(max_length=200, blank=True, default="")
+    completed_at = models.DateTimeField(null=True, blank=True)
     due_date = models.DateTimeField(null=True, blank=True)
     status = models.CharField(
         max_length=20,
@@ -242,7 +245,7 @@ class Mitigation(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ["-created_at"]
+        ordering = ["created_at", "id"]
 
     def __str__(self):
         return f"{self.risk.id} - {self.title}"

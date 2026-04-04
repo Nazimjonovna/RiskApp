@@ -403,6 +403,16 @@ def _all_mitigation_actions_approved(risk):
     )
 
 
+def _sync_risk_mitigation_owners(risk, responsible_value):
+    normalized_responsible = str(responsible_value or "").strip()
+    if not normalized_responsible:
+        return
+
+    Mitigation.objects.filter(risk=risk).exclude(
+        status=MITIGATION_APPROVED_STATUS,
+    ).update(owner=normalized_responsible)
+
+
 class DepartmentView(APIView):
     permission_classes = [IsAuthenticated, IsReadOnlyOrSuperAdmin]
     
@@ -701,6 +711,8 @@ class RiskCRUDView(APIView):
             )
             if serializer.is_valid():
                 updated_risk = serializer.save()
+                if "responsible" in payload_data:
+                    _sync_risk_mitigation_owners(updated_risk, updated_risk.responsible)
                 notify_risk_update(old_risk, updated_risk)
                 return Response({
                     "data":serializer.data,
@@ -1054,21 +1066,24 @@ class CreateMitigationView(APIView):
             }, status=status.HTTP_403_FORBIDDEN)
 
         mutable_data = request.data.copy()
-        mutable_data["department_director"] = mutable_data.get("department_director") or _request_actor_label(request)
         mutable_data["status"] = mutable_data.get("status") or "NOT_STARTED"
+        actor = _request_actor_label(request)
 
         serialzier = MitigationSerializer(data = mutable_data)
         if serialzier.is_valid():
-            mitigation = serialzier.save()
+            mitigation = serialzier.save(
+                department_director=actor,
+                created_by=actor,
+            )
             notify_mitigation_create(mitigation)
             _ensure_mitigation_risk_in_progress(
                 mitigation,
-                _request_actor_label(request),
+                actor,
                 notes="Mitigation action created.",
             )
             _log_mitigation_activity(
                 mitigation,
-                _request_actor_label(request),
+                actor,
                 "Mitigation action created",
                 notes=mutable_data.get("notes", "") or "",
                 activity_type="ASSIGNMENT",
@@ -1195,10 +1210,15 @@ class MitigationCRUDView(APIView):
             old_mitigation = Mitigation.objects.get(id=pk)
             serializer = MitigationSerializer(instance = mitigation, data = request.data, partial = True)
             if serializer.is_valid():
-                updated_mitigation = serializer.save()
+                actor = _request_actor_label(request)
+                save_kwargs = {}
+                if is_risk_dept and requested_status == "IN_PROGRESS" and _normalize_status_token(old_mitigation.status) == MITIGATION_REVIEWABLE_STATUS:
+                    save_kwargs["completed_by"] = ""
+                    save_kwargs["completed_at"] = None
+
+                updated_mitigation = serializer.save(**save_kwargs)
                 notify_mitigation_update(old_mitigation, updated_mitigation)
 
-                actor = _request_actor_label(request)
                 if is_risk_dept and requested_status == MITIGATION_APPROVED_STATUS:
                     _log_mitigation_activity(
                         updated_mitigation,
@@ -1284,10 +1304,15 @@ class StaffRiskMitigationCRYDView(APIView):
             old_mitigation = Mitigation.objects.get(id=pk)
             serializer = MitigationSerializer(instance = mitigation, data = request.data, partial = True)
             if serializer.is_valid():
-                updated_mitigation = serializer.save()
+                actor = _request_actor_label(request)
+                save_kwargs = {}
+                if requested_status == MITIGATION_REVIEWABLE_STATUS:
+                    save_kwargs["completed_by"] = actor
+                    save_kwargs["completed_at"] = timezone.now()
+
+                updated_mitigation = serializer.save(**save_kwargs)
                 notify_mitigation_update(old_mitigation, updated_mitigation)
 
-                actor = _request_actor_label(request)
                 if requested_status == MITIGATION_REVIEWABLE_STATUS:
                     _ensure_mitigation_risk_in_progress(
                         updated_mitigation,
