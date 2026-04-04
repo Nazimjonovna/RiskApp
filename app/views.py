@@ -28,6 +28,7 @@ from .services.keycloak_departments import (
     resolve_user_department,
     sync_departments_from_keycloak,
 )
+from .services.department_identity import canonical_department_key
 from .models import (Department, Category,  Risk, RiskActivity, RiskCommittee, RiskDecition,
                      Mitigation, ReplyRiskActivity)
 
@@ -203,7 +204,7 @@ def _request_department_candidates(request):
     candidates = set()
     for value in values:
         normalized = _normalize_identity_value(value)
-        canonical = _canonical_department_key(value)
+        canonical = canonical_department_key(value)
         if normalized:
             candidates.add(normalized)
         if canonical:
@@ -224,7 +225,7 @@ def _department_identity_candidates(department):
     candidates = set()
     for value in values:
         normalized = _normalize_identity_value(value)
-        canonical = _canonical_department_key(value)
+        canonical = canonical_department_key(value)
         if normalized:
             candidates.add(normalized)
         if canonical:
@@ -237,13 +238,25 @@ def _is_risk_related_department_director(request, risk):
         return False
 
     request_departments = _request_department_candidates(request)
+
+    try:
+        request_department = resolve_user_department(request.auth or {}, sync=False)
+    except DepartmentResolutionError:
+        request_department = None
+
+    if request_department:
+        request_departments.update(_department_identity_candidates(request_department))
+
     risk_departments = set()
-    for department in [
-        getattr(risk, "department", None),
+    prioritized_departments = [
         getattr(risk, "responsible_department_id", None),
-    ]:
+        getattr(risk, "department", None),
+    ]
+
+    for department in prioritized_departments:
         if department:
             risk_departments.update(_department_identity_candidates(department))
+
     return bool(request_departments & risk_departments)
 
 

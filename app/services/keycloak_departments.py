@@ -4,6 +4,7 @@ import requests
 from django.conf import settings
 
 from app.models import Department
+from app.services.department_identity import canonical_department_key, department_identity_candidates
 
 
 _admin_token_cache = {"value": None, "expires_at": 0.0}
@@ -34,6 +35,58 @@ def _group_display_name(group):
         or str(group.get("name") or "").strip()
         or _group_name_from_path(group.get("path"))
     )
+
+
+def _department_match_score(department, group_id=None, path=None, *values):
+    score = 0
+    normalized_path = _normalize_group_path(path)
+    department_path = _normalize_group_path(getattr(department, "keycloak_path", ""))
+    department_group_id = str(getattr(department, "keycloak_group_id", "") or "").strip()
+
+    if group_id and department_group_id and department_group_id == str(group_id).strip():
+        return 1000
+
+    if normalized_path and department_path and department_path == normalized_path:
+        score += 500
+
+    candidate_overlap = department_identity_candidates(
+        getattr(department, "name", ""),
+        getattr(department, "keycloak_path", ""),
+    ) & department_identity_candidates(normalized_path, *values)
+    score += len(candidate_overlap) * 100
+
+    department_canonical = canonical_department_key(getattr(department, "name", "")) or canonical_department_key(
+        getattr(department, "keycloak_path", "")
+    )
+    value_canonical = canonical_department_key(normalized_path)
+    if not value_canonical:
+        for value in values:
+            value_canonical = canonical_department_key(value)
+            if value_canonical:
+                break
+
+    if department_canonical and value_canonical and department_canonical == value_canonical:
+        score += 75
+
+    if department_path:
+        score += 10
+    if department_group_id:
+        score += 5
+
+    return score
+
+
+def _find_matching_department(group_id=None, path=None, *values):
+    best_department = None
+    best_score = 0
+
+    for department in Department.objects.all():
+        score = _department_match_score(department, group_id, path, *values)
+        if score > best_score:
+            best_score = score
+            best_department = department
+
+    return best_department if best_score > 0 else None
 
 
 def _flatten_groups(groups):
@@ -248,21 +301,7 @@ def _upsert_department(group):
     technical_name = str(group.get("name") or _group_name_from_path(path)).strip()
     display_name = _group_display_name(group)
 
-    department = None
-    if group_id:
-        department = Department.objects.filter(keycloak_group_id=group_id).first()
-    if department is None and path:
-        department = Department.objects.filter(keycloak_path=path).first()
-    if department is None and display_name:
-        department = Department.objects.filter(
-            keycloak_group_id__isnull=True,
-            name=display_name,
-        ).first()
-    if department is None and technical_name:
-        department = Department.objects.filter(
-            keycloak_group_id__isnull=True,
-            name=technical_name,
-        ).first()
+    department = _find_matching_department(group_id, path, display_name, technical_name)
 
     defaults = {
         "name": display_name,
@@ -308,6 +347,21 @@ def sync_departments_from_keycloak(force=False):
     return _department_list_queryset()
 
 
+def _resolve_departments_for_group_paths(group_paths):
+    matches = []
+    seen_ids = set()
+
+    for group_path in group_paths:
+        normalized_path = _normalize_group_path(group_path)
+        department = _find_matching_department(None, normalized_path, _group_name_from_path(normalized_path))
+        if not department or department.id in seen_ids:
+            continue
+        seen_ids.add(department.id)
+        matches.append((department, normalized_path))
+
+    return matches
+
+
 def _token_group_paths(payload):
     groups = payload.get("groups") or []
     return sorted(
@@ -347,14 +401,15 @@ def ensure_departments_for_group_paths(group_paths):
         if not normalized_path:
             continue
 
-        department = Department.objects.filter(keycloak_path=normalized_path).first()
-        if department is None:
-            department = Department.objects.create(
-                name=_group_name_from_path(normalized_path),
-                keycloak_path=normalized_path,
-                is_active=True,
-            )
-        elif not department.is_active:
+        department = _upsert_department(
+            {
+                "id": None,
+                "name": _group_name_from_path(normalized_path),
+                "description": "",
+                "path": normalized_path,
+            }
+        )
+        if not department.is_active:
             department.is_active = True
             department.save(update_fields=["is_active"])
         created.append(department)
@@ -376,26 +431,32 @@ def resolve_user_department(payload, sync=False):
     if not group_paths:
         return None
 
-    departments = list(
-        Department.objects.filter(
-            is_active=True,
-            keycloak_path__in=group_paths,
-        ).order_by("name")
-    )
+    departments_with_paths = [
+        (department, matched_path)
+        for department, matched_path in _resolve_departments_for_group_paths(group_paths)
+        if department.is_active
+    ]
 
-    if not departments:
+    if not departments_with_paths:
         departments = ensure_departments_for_group_paths(group_paths)
+        departments_with_paths = [
+            (department, _normalize_group_path(department.keycloak_path))
+            for department in departments
+        ]
 
-    if not departments:
+    if not departments_with_paths:
         return None
 
-    departments.sort(key=lambda department: len(department.keycloak_path or ""), reverse=True)
-    if len(departments) > 1:
-        top_length = len(departments[0].keycloak_path or "")
-        second_length = len(departments[1].keycloak_path or "")
+    departments_with_paths.sort(
+        key=lambda item: len(item[1] or item[0].keycloak_path or ""),
+        reverse=True,
+    )
+    if len(departments_with_paths) > 1:
+        top_length = len(departments_with_paths[0][1] or departments_with_paths[0][0].keycloak_path or "")
+        second_length = len(departments_with_paths[1][1] or departments_with_paths[1][0].keycloak_path or "")
         if top_length == second_length:
             raise DepartmentResolutionError(
                 "User belongs to multiple Keycloak departments. Narrow the group mapping."
             )
 
-    return departments[0]
+    return departments_with_paths[0][0]

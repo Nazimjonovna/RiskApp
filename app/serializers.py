@@ -83,6 +83,11 @@ class RiskSerializer(serializers.ModelSerializer):
                 )
 
             if department is None:
+                requested_department = validated_data.get("department") or validated_data.get("responsible_department_id")
+                if requested_department:
+                    department = requested_department
+
+            if department is None:
                 raise serializers.ValidationError(
                     {
                         "created_by_department_id": (
