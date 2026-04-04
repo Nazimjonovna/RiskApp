@@ -45,6 +45,12 @@ MITIGATION_STAGE_RISK_STATUSES = {
     "ADDITIONAL_MITIGATION_REQUIRED",
 }
 
+DIRECTOR_ASSIGNABLE_RISK_STATUSES = {
+    "COMMITTEE_REVIEW_1",
+    "COMMITTEE_REVIEW_2",
+    *MITIGATION_STAGE_RISK_STATUSES,
+}
+
 MITIGATION_PERFORMER_EDITABLE_STATUSES = {
     "NOT_STARTED",
     "IN_PROGRESS",
@@ -643,7 +649,7 @@ class RiskCRUDView(APIView):
                 allowed = (
                     requested_fields.issubset(director_editable_fields)
                     and _is_risk_related_department_director(request, risk)
-                    and _normalize_status_token(risk.status) in MITIGATION_STAGE_RISK_STATUSES
+                    and _normalize_status_token(risk.status) in DIRECTOR_ASSIGNABLE_RISK_STATUSES
                 )
                 if allowed:
                     try:
