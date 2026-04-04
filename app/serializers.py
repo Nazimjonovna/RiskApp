@@ -62,6 +62,12 @@ class RiskSerializer(serializers.ModelSerializer):
     class Meta:
         model = Risk
         fields = '__all__'
+        extra_kwargs = {
+            "responsible": {"allow_blank": True, "required": False},
+            "risk_manager": {"allow_blank": True, "required": False},
+            "risk_derector": {"allow_blank": True, "required": False},
+            "owner": {"allow_blank": True, "required": False},
+        }
 
     def create(self, validated_data):
         request = self.context.get("request")
