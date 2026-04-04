@@ -5,7 +5,8 @@ from .views import (DepartmentView, DepartmentCRUDView, CategoryView, CategoryCR
                     CreateMitigationView, MitigationCRUDView, GetRiskMitigationView,
                     FilterRiskByStatusView, UpcomingRiskAPIView,ReplyRiskActivityCRUDView,
                     ReplyRiskActivityCreateView, UpdateRiskView, AssignRiskView, AddRecipientToRiskView,
-                    RiskCloseView, MeView, GetTokenView, UserRiskCrudView, StaffRiskMitigationCRYDView)
+                    RiskCloseView, MeView, GetTokenView, UserRiskCrudView, StaffRiskMitigationCRYDView,
+                    DepartmentMemberDirectoryView)
 
 
 urlpatterns = [
@@ -36,4 +37,5 @@ urlpatterns = [
      path('api/risk/close/<int:pk>/', RiskCloseView.as_view()), #id risk.id userni requestdan olaman
      path("token/", GetTokenView.as_view()),
      path("me/", MeView.as_view()),
+     path("api/directory/department-members/", DepartmentMemberDirectoryView.as_view()),
 ]

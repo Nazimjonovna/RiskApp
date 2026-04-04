@@ -6,20 +6,310 @@ from rest_framework import status
 import requests
 from django.conf import settings
 from django.shortcuts import get_object_or_404
+from django.db.models import Prefetch
 from .services.risk_activity import create_risk_activity_and_notify, add_user_to_risk_activity
 from .services.notification import notify_risk_update, notify_mitigation_update, notify_mitigation_create
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from .permissions import IsTopManager
+from .permissions import (
+    IsReadOnlyOrSuperAdmin,
+    get_request_realm_roles,
+    has_any_logical_role,
+    has_logical_role,
+)
 from drf_yasg.utils import swagger_auto_schema
 from .serializers import (RiskActivitySerializer, RiskCommitteeSerializer, RiskDecisionSerializer,
                           RiskSerializer, MitigationSerializer, DepartmentSerializer, StatusSerializer,
                           CategorySerializer, ReplyRiskActivitySerializer, UserSerializer)
+from .services.keycloak_departments import (
+    DepartmentResolutionError,
+    _fetch_group_members,
+    get_user_group_paths,
+    resolve_user_department,
+    sync_departments_from_keycloak,
+)
 from .models import (Department, Category,  Risk, RiskActivity, RiskCommittee, RiskDecition,
                      Mitigation, ReplyRiskActivity)
 
 
+CREATOR_EDITABLE_RISK_STATUSES = {
+    "DRAFT",
+    "INFO_REQUESTED_BY_RISK_MANAGER",
+    "INFO_REQUESTED_BY_COMMITTEE",
+}
+
+MITIGATION_STAGE_RISK_STATUSES = {
+    "ACCEPTED_FOR_MITIGATION",
+    "IN_MITIGATION",
+    "ADDITIONAL_MITIGATION_REQUIRED",
+}
+
+MITIGATION_PERFORMER_EDITABLE_STATUSES = {
+    "NOT_STARTED",
+    "IN_PROGRESS",
+}
+
+MITIGATION_REVIEWABLE_STATUS = "PENDING_RISK_REVIEW"
+MITIGATION_APPROVED_STATUS = "APPROVED"
+
+
+def _normalize_identity_value(value):
+    return str(value or "").strip().lower()
+
+
+def _normalize_status_token(value):
+    return str(value or "").strip().upper().replace(" ", "_").replace("-", "_")
+
+
+def _request_identity_candidates(request):
+    payload = request.auth or {}
+    user = request.user
+    given_name = str(payload.get("given_name") or "").strip()
+    family_name = str(payload.get("family_name") or "").strip()
+    full_name = " ".join(part for part in [given_name, family_name] if part).strip()
+    values = [
+        payload.get("preferred_username"),
+        payload.get("email"),
+        payload.get("name"),
+        full_name,
+        getattr(user, "username", None),
+        getattr(user, "email", None),
+        getattr(user, "get_full_name", lambda: "")(),
+        payload.get("sub"),
+        getattr(user, "id", None),
+    ]
+
+    return {
+        _normalize_identity_value(value)
+        for value in values
+        if value is not None and _normalize_identity_value(value)
+    }
+
+
+def _is_risk_creator(request, risk):
+    creator_value = _normalize_identity_value(getattr(risk, "created_by_user_id", ""))
+    return bool(creator_value) and creator_value in _request_identity_candidates(request)
+
+
+def _request_actor_label(request):
+    payload = request.auth or {}
+    user = request.user
+    return (
+        payload.get("preferred_username")
+        or getattr(user, "username", None)
+        or payload.get("email")
+        or "System"
+    )
+
+
+def _directory_member_label(member):
+    joined_name = " ".join(
+        part
+        for part in [
+            str(member.get("firstName") or "").strip(),
+            str(member.get("lastName") or "").strip(),
+        ]
+        if part
+    ).strip()
+    return (
+        joined_name
+        or str(member.get("username") or "").strip()
+        or str(member.get("email") or "").strip()
+        or str(member.get("id") or "").strip()
+    )
+
+
+def _request_department_candidates(request):
+    payload = request.auth or {}
+    values = [
+        payload.get("department"),
+        payload.get("dept"),
+        payload.get("org_unit"),
+        payload.get("organization"),
+        payload.get("division"),
+    ]
+    group_paths = get_user_group_paths(payload)
+    values.extend(group_paths)
+    values.extend(
+        path.rsplit("/", 1)[-1]
+        for path in group_paths
+        if isinstance(path, str) and path.strip()
+    )
+
+    try:
+        department = resolve_user_department(payload, sync=False)
+    except DepartmentResolutionError:
+        department = None
+
+    if department:
+        values.extend(_department_identity_candidates(department))
+
+    return {
+        _normalize_identity_value(value)
+        for value in values
+        if _normalize_identity_value(value)
+    }
+
+
+def _department_identity_candidates(department):
+    values = [
+        getattr(department, "name", None),
+        getattr(department, "keycloak_path", None),
+    ]
+
+    keycloak_path = str(getattr(department, "keycloak_path", "") or "").strip()
+    if keycloak_path:
+        values.append(keycloak_path.rsplit("/", 1)[-1])
+
+    return {
+        _normalize_identity_value(value)
+        for value in values
+        if _normalize_identity_value(value)
+    }
+
+
+def _is_risk_related_department_director(request, risk):
+    if not has_logical_role(request, "dept-director"):
+        return False
+
+    request_departments = _request_department_candidates(request)
+    risk_departments = set()
+    for department in [
+        getattr(risk, "department", None),
+        getattr(risk, "responsible_department_id", None),
+    ]:
+        if department:
+            risk_departments.update(_department_identity_candidates(department))
+    return bool(request_departments & risk_departments)
+
+
+def _has_risk_mitigation_assignment(request, risk):
+    identities = _request_identity_candidates(request)
+    if not identities:
+        return False
+
+    for mitigation in getattr(risk, "mitigations", []).all():
+        if _normalize_identity_value(mitigation.owner) in identities:
+            return True
+
+    return False
+
+
+def _can_view_risk(request, risk):
+    if has_any_logical_role(request, ["super-admin", "risk-dept", "risk-committee"]):
+        return True
+
+    if _is_risk_creator(request, risk):
+        return True
+
+    if _normalize_identity_value(getattr(risk, "responsible", "")) in _request_identity_candidates(request):
+        return True
+
+    if _is_risk_related_department_director(request, risk):
+        return True
+
+    if _has_risk_mitigation_assignment(request, risk):
+        return True
+
+    return False
+
+
+def _scoped_risk_queryset():
+    return Risk.objects.select_related(
+        "department",
+        "category",
+        "responsible_department_id",
+    ).prefetch_related(
+        Prefetch("mitigations", queryset=Mitigation.objects.only("id", "risk_id", "owner"))
+    )
+
+
+def _get_scoped_risks_for_request(request):
+    risks = _scoped_risk_queryset()
+    if has_any_logical_role(request, ["super-admin", "risk-dept", "risk-committee"]):
+        return risks
+    return [risk for risk in risks if _can_view_risk(request, risk)]
+
+
+def _is_mitigation_owner(request, mitigation):
+    return _normalize_identity_value(getattr(mitigation, "owner", "")) in _request_identity_candidates(request)
+
+
+def _is_mitigation_department_director(request, mitigation):
+    return _is_risk_related_department_director(request, mitigation.risk)
+
+
+def _can_view_mitigation(request, mitigation):
+    return _can_view_risk(request, mitigation.risk) or _is_mitigation_owner(request, mitigation)
+
+
+def _ensure_mitigation_risk_in_progress(mitigation, actor, notes=""):
+    risk = mitigation.risk
+    if _normalize_status_token(risk.status) in {"ACCEPTED_FOR_MITIGATION", "ADDITIONAL_MITIGATION_REQUIRED"}:
+        risk.status = "IN_MITIGATION"
+        risk.last_reviewed_at = timezone.now()
+        risk.save(update_fields=["status", "last_reviewed_at", "updated_at"])
+        RiskActivity.objects.create(
+            risk=risk,
+            type="REVIEW",
+            title="Mitigation in progress",
+            notes=notes or "Mitigation work is in progress.",
+            by=actor,
+            diff={
+                "workflowStatus": "In Mitigation",
+                "mitigationId": mitigation.id,
+                "mitigationTitle": mitigation.title,
+            },
+        )
+
+
+def _log_mitigation_activity(mitigation, actor, title, notes="", activity_type="REVIEW", extra_diff=None):
+    diff = {
+        "mitigationId": mitigation.id,
+        "mitigationTitle": mitigation.title,
+        "mitigationStatus": mitigation.status,
+    }
+    if extra_diff:
+        diff.update(extra_diff)
+
+    RiskActivity.objects.create(
+        risk=mitigation.risk,
+        type=activity_type,
+        title=title,
+        notes=notes,
+        by=actor,
+        diff=diff,
+    )
+
+
+def _advance_risk_to_committee_review_2_if_ready(risk, actor):
+    mitigations = list(risk.mitigations.all())
+    if not mitigations:
+        return
+
+    if any(_normalize_status_token(mitigation.status) != MITIGATION_APPROVED_STATUS for mitigation in mitigations):
+        return
+
+    if _normalize_status_token(risk.status) == "COMMITTEE_REVIEW_2":
+        return
+
+    risk.status = "COMMITTEE_REVIEW_2"
+    risk.last_reviewed_at = timezone.now()
+    risk.save(update_fields=["status", "last_reviewed_at", "updated_at"])
+
+    RiskActivity.objects.create(
+        risk=risk,
+        type="REVIEW",
+        title="All mitigation actions approved",
+        notes="All mitigation actions were approved by the risk department and sent to Committee Review 2.",
+        by=actor,
+        diff={
+            "workflowStatus": "Committee Review 2",
+        },
+    )
+
+
 class DepartmentView(APIView):
-    # permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsReadOnlyOrSuperAdmin]
     
     @swagger_auto_schema(request_body=DepartmentSerializer, tags = ['Department'])
     def post(self, request, *args, **kwargs):
@@ -37,7 +327,15 @@ class DepartmentView(APIView):
             
     @swagger_auto_schema(tags = ['Department'])
     def get(self, request, *args,**kwargs):
-        departments = Department.objects.all()
+        try:
+            departments = sync_departments_from_keycloak()
+        except Exception:
+            departments = Department.objects.filter(
+                is_active=True,
+                keycloak_path__isnull=False,
+            ).order_by("name")
+            if not departments.exists():
+                departments = Department.objects.filter(is_active=True).order_by("name")
         serializer = DepartmentSerializer(departments, many = True)
         return Response({
             "data":serializer.data,
@@ -46,7 +344,7 @@ class DepartmentView(APIView):
         
 
 class DepartmentCRUDView(APIView):
-    # permission_classes = [IsAuthenticated] # keyinchalik faqat risk role dagila qo'sha oladigan permission beramiz
+    permission_classes = [IsAuthenticated, IsReadOnlyOrSuperAdmin]
     
     @swagger_auto_schema(tags = ['Department'])
     def get(self, request, pk, *args, **kwargs):
@@ -97,7 +395,7 @@ class DepartmentCRUDView(APIView):
             
             
 class CategoryView(APIView):
-    permission_classes = [IsAuthenticated, IsTopManager]
+    permission_classes = [IsAuthenticated, IsReadOnlyOrSuperAdmin]
     
     @swagger_auto_schema(request_body=CategorySerializer, tags = ['Category'])
     def post(self, request, *args, **kwargs):
@@ -124,7 +422,7 @@ class CategoryView(APIView):
         
 
 class CategoryCRUDView(APIView):
-    permission_classes = [IsAuthenticated, IsTopManager] # keyinchalik faqat risk role dagila qo'sha oladigan permission beramiz
+    permission_classes = [IsAuthenticated, IsReadOnlyOrSuperAdmin]
     
     @swagger_auto_schema(tags = ['Category'])
     def get(self, request, pk, *args, **kwargs):
@@ -175,11 +473,11 @@ class CategoryCRUDView(APIView):
             
             
 class CreateRiskView(APIView):
-    # permission_classes = [IsAuthenticated, ]
+    permission_classes = [IsAuthenticated]
     
     @swagger_auto_schema(request_body=RiskSerializer, tags=['Risk'])
     def post(self, request, *args, **kwargs):
-        serializer = RiskSerializer(data=request.data)
+        serializer = RiskSerializer(data=request.data, context={"request": request})
 
         if serializer.is_valid():
             risk = serializer.save()
@@ -202,7 +500,7 @@ class CreateRiskView(APIView):
             
     @swagger_auto_schema(tags = ['Risk'])
     def get(self, request, *args, **kwargs):
-        risk = Risk.objects.all()
+        risk = _get_scoped_risks_for_request(request)
         serializer = RiskSerializer(risk, many = True)
         return Response({
             "data":serializer.data
@@ -210,12 +508,17 @@ class CreateRiskView(APIView):
         
         
 class RiskCRUDView(APIView):
-    permission_classes = [IsAuthenticated, IsTopManager] 
+    permission_classes = [IsAuthenticated]
     
     @swagger_auto_schema(tags = ['Risk'])
     def get(self, request, pk, *args, **kwargs):
         risk = Risk.objects.filter(id = pk).first()
         if risk:
+            if not _can_view_risk(request, risk):
+                return Response({
+                    "detail": "You do not have access to this risk.",
+                    "status": status.HTTP_403_FORBIDDEN,
+                }, status=status.HTTP_403_FORBIDDEN)
             serializer = RiskSerializer(risk)
             return Response({
                 "data":serializer.data
@@ -227,6 +530,11 @@ class RiskCRUDView(APIView):
             
     @swagger_auto_schema(tags = ["Risk"])
     def delete(self, request, pk, *args, **kwargs):
+        if not has_logical_role(request, "super-admin"):
+            return Response({
+                "detail": "Only super admins can delete risk records.",
+                "status": status.HTTP_403_FORBIDDEN,
+            }, status=status.HTTP_403_FORBIDDEN)
         risk = Risk.objects.get(id = pk)
         if risk:
             risk.delete()
@@ -242,8 +550,35 @@ class RiskCRUDView(APIView):
     def patch(self, request, pk, *args, **kwargs):
         risk = Risk.objects.filter(id =pk).first()
         if risk:
+            allowed = has_any_logical_role(request, ["risk-dept", "risk-committee"])
+
+            if not allowed and has_logical_role(request, "dept-director"):
+                director_editable_fields = {
+                    "responsible",
+                    "responsible_department_id",
+                    "due_date",
+                    "last_reviewed_at",
+                }
+                requested_fields = set(request.data.keys())
+                allowed = (
+                    requested_fields.issubset(director_editable_fields)
+                    and _is_risk_related_department_director(request, risk)
+                    and _normalize_status_token(risk.status) in MITIGATION_STAGE_RISK_STATUSES
+                )
+
+            if not allowed:
+                return Response({
+                    "detail": "You do not have permission to update this risk.",
+                    "status": status.HTTP_403_FORBIDDEN,
+                }, status=status.HTTP_403_FORBIDDEN)
+
             old_risk = Risk.objects.get(id=pk)
-            serializer = RiskSerializer(instance = risk, data = request.data, partial = True)
+            serializer = RiskSerializer(
+                instance=risk,
+                data=request.data,
+                partial=True,
+                context={"request": request},
+            )
             if serializer.is_valid():
                 updated_risk = serializer.save()
                 notify_risk_update(old_risk, updated_risk)
@@ -262,15 +597,26 @@ class RiskCRUDView(APIView):
             
             
 class UserRiskCrudView(APIView):
-    # permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated]
     
     @swagger_auto_schema(request_body=RiskSerializer, tags = ['Risk'])
     def patch(self, request, pk, *args, **kwargs):
         risk = Risk.objects.filter(id =pk).first()
         if risk:
             old_risk = Risk.objects.get(id=pk)
-            if old_risk.status == "DRAFT":
-                serializer = RiskSerializer(instance = risk, data = request.data, partial = True)
+            if not _is_risk_creator(request, old_risk):
+                return Response({
+                    "detail": "Only the risk creator can update this record.",
+                    "status": status.HTTP_403_FORBIDDEN,
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            if _normalize_status_token(old_risk.status) in CREATOR_EDITABLE_RISK_STATUSES:
+                serializer = RiskSerializer(
+                    instance=risk,
+                    data=request.data,
+                    partial=True,
+                    context={"request": request},
+                )
                 if serializer.is_valid():
                     updated_risk = serializer.save()
                     notify_risk_update(old_risk, updated_risk)
@@ -281,26 +627,29 @@ class UserRiskCrudView(APIView):
                 else:
                     return Response({
                         "errors":serializer.errors
-                    })
+                    }, status=status.HTTP_400_BAD_REQUEST)
             else:
                 return Response({
-                    "detail":"This one given for check",
+                    "detail":"This risk can only be updated by the creator while it is Draft or awaiting an information response.",
                     "status":status.HTTP_400_BAD_REQUEST
-                })
+                }, status=status.HTTP_400_BAD_REQUEST)
         else:
             return Response({
                 "status":status.HTTP_404_NOT_FOUND
-            })
+            }, status=status.HTTP_404_NOT_FOUND)
             
             
 class RiskCloseView(APIView):
-    permission_classes = [IsAuthenticated, IsTopManager] #add permission only for risk.derector
+    permission_classes = [IsAuthenticated]
     
     @swagger_auto_schema(tag = ['Risk'])
     def get(self, request, pk, *args, **kwargs):
         user = request.user
         risk = Risk.objects.filter(id = pk).first()
-        if risk and user == risk.risk_derector:
+        if risk and (
+            _normalize_identity_value(getattr(user, "username", "")) == _normalize_identity_value(risk.risk_derector)
+            or has_logical_role(request, "risk-committee")
+        ):
             risk.status = 'CLOSED'
             risk.is_active = False
             risk.save()
@@ -316,7 +665,7 @@ class RiskCloseView(APIView):
 
 
 class CreateRiskActivityView(APIView):
-    # permission_classes = [IsAuthenticated, ]
+    permission_classes = [IsAuthenticated]
     
     @swagger_auto_schema(request_body=RiskActivitySerializer, tags = ['RiskActivity'])
     def post(self, request, *args, **kwargs):
@@ -334,7 +683,8 @@ class CreateRiskActivityView(APIView):
             
     @swagger_auto_schema(tags = ['RiskActivity'])
     def get(self, request, *args, **kwargs):
-        riskactivity = RiskActivity.objects.all()
+        visible_risk_ids = {risk.id for risk in _get_scoped_risks_for_request(request)}
+        riskactivity = RiskActivity.objects.filter(risk_id__in=visible_risk_ids)
         serializer = RiskActivitySerializer(riskactivity, many = True)
         return Response({
             "data":serializer.data
@@ -473,10 +823,15 @@ class RiskCommitteeCRUDView(APIView):
             
             
 class CreateRiskDecitionView(APIView):
-    # permission_classes = [IsAuthenticated, ]
+    permission_classes = [IsAuthenticated]
     
     @swagger_auto_schema(request_body=RiskDecisionSerializer, tags = ['RiskDecition'])
     def post(self, request, *args, **kwargs):
+        if not has_any_logical_role(request, ["risk-dept", "risk-committee"]):
+            return Response({
+                "detail": "Only risk department and committee members can create decisions.",
+                "status": status.HTTP_403_FORBIDDEN,
+            }, status=status.HTTP_403_FORBIDDEN)
         serializer = RiskDecisionSerializer(data = request.data)
         if serializer.is_valid():
             serializer.save()
@@ -491,7 +846,8 @@ class CreateRiskDecitionView(APIView):
             
     @swagger_auto_schema(tags = ['RiskDecition'])
     def get(self, request, *args, **kwargs):
-        decisition = RiskDecition.objects.all()
+        visible_risk_ids = {risk.id for risk in _get_scoped_risks_for_request(request)}
+        decisition = RiskDecition.objects.filter(risk_id__in=visible_risk_ids)
         serializer = RiskDecisionSerializer(decisition, many = True)
         return Response({
             "data":serializer.data,
@@ -554,26 +910,64 @@ class RiskDecitionCRUDView(APIView):
             
             
 class CreateMitigationView(APIView):
-    permission_classes = [IsAuthenticated, IsTopManager]
+    permission_classes = [IsAuthenticated]
     
     @swagger_auto_schema(request_body=MitigationSerializer, tags = ['Mitigation'])
     def post(self, request, *args, **kwargs):
-        serialzier = MitigationSerializer(data = request.data)
+        risk_id = request.data.get("risk")
+        risk = Risk.objects.select_related("responsible_department_id", "department").filter(id=risk_id).first()
+        if not risk:
+            return Response({
+                "errors": {"risk": ["Risk not found."]},
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if not has_any_logical_role(request, ["risk-dept", "risk-committee", "dept-director"]):
+            return Response({
+                "detail": "Only risk department, risk committee, and department directors can create mitigation actions.",
+                "status": status.HTTP_403_FORBIDDEN,
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        if has_logical_role(request, "dept-director") and not _is_risk_related_department_director(request, risk):
+            return Response({
+                "detail": "Department directors can only create mitigation actions for their own department.",
+                "status": status.HTTP_403_FORBIDDEN,
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        mutable_data = request.data.copy()
+        mutable_data["department_director"] = mutable_data.get("department_director") or _request_actor_label(request)
+        mutable_data["status"] = mutable_data.get("status") or "NOT_STARTED"
+
+        serialzier = MitigationSerializer(data = mutable_data)
         if serialzier.is_valid():
             mitigation = serialzier.save()
             notify_mitigation_create(mitigation)
+            _ensure_mitigation_risk_in_progress(
+                mitigation,
+                _request_actor_label(request),
+                notes="Mitigation action created.",
+            )
+            _log_mitigation_activity(
+                mitigation,
+                _request_actor_label(request),
+                "Mitigation action created",
+                notes=mutable_data.get("notes", "") or "",
+                activity_type="ASSIGNMENT",
+            )
             return Response({
                 "data":serialzier.data,
                 "status":status.HTTP_201_CREATED
-            })
+            }, status=status.HTTP_201_CREATED)
         else:
             return Response({
                 "errors":serialzier.errors
-            })
+            }, status=status.HTTP_400_BAD_REQUEST)
             
     @swagger_auto_schema(tags = ['Mitigation'])
     def get(self, request, *args, **kwargs):
-        mitigation = Mitigation.objects.all()
+        mitigation = [
+            item for item in Mitigation.objects.select_related("risk", "risk__responsible_department_id", "risk__department").all()
+            if _can_view_mitigation(request, item)
+        ]
         seralizer = MitigationSerializer(mitigation, many =True)
         return Response({
             "data":seralizer.data,
@@ -582,12 +976,17 @@ class CreateMitigationView(APIView):
         
 
 class MitigationCRUDView(APIView):
-    permission_classes = [IsAuthenticated, IsTopManager]
+    permission_classes = [IsAuthenticated]
     
     @swagger_auto_schema(tags = ['Mitigation'])
     def get(self, request, pk, *args, **kwargs):
         mitigation = Mitigation.objects.filter(id = pk).first()
         if mitigation:
+            if not _can_view_mitigation(request, mitigation):
+                return Response({
+                    "detail": "You do not have access to this mitigation action.",
+                    "status": status.HTTP_403_FORBIDDEN,
+                }, status=status.HTTP_403_FORBIDDEN)
             serializer = MitigationSerializer(mitigation)
             return Response({
                 "data":serializer.data,
@@ -601,8 +1000,18 @@ class MitigationCRUDView(APIView):
             
     @swagger_auto_schema(tags = ['Mitigation'])
     def delete(self, request, pk, *args, **kwargs):
+        if not has_any_logical_role(request, ["risk-dept", "dept-director"]):
+            return Response({
+                "detail": "You do not have permission to delete mitigation actions.",
+                "status": status.HTTP_403_FORBIDDEN,
+            }, status=status.HTTP_403_FORBIDDEN)
         mitigation = Mitigation.objects.filter(id = pk).first()
         if mitigation:
+            if has_logical_role(request, "dept-director") and not _is_mitigation_department_director(request, mitigation):
+                return Response({
+                    "detail": "Department directors can only delete mitigation actions in their own department.",
+                    "status": status.HTTP_403_FORBIDDEN,
+                }, status=status.HTTP_403_FORBIDDEN)
             mitigation.delete()
             return Response({
                 "status":status.HTTP_200_OK
@@ -615,60 +1024,187 @@ class MitigationCRUDView(APIView):
     
     @swagger_auto_schema(request_body=MitigationSerializer, tags = ['Mitigation'])
     def patch(self, request, pk, *args, **kwargs):
-        mitigation = Mitigation.objects.get(id = pk)
+        mitigation = Mitigation.objects.select_related("risk", "risk__responsible_department_id", "risk__department").get(id = pk)
         if mitigation:
+            is_risk_dept = has_logical_role(request, "risk-dept")
+            is_dept_director = has_logical_role(request, "dept-director")
+            requested_status = _normalize_status_token(request.data.get("status"))
+
+            if not is_risk_dept and not is_dept_director:
+                return Response({
+                    "detail": "You do not have permission to manage mitigation actions.",
+                    "status": status.HTTP_403_FORBIDDEN,
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            if is_dept_director and not _is_mitigation_department_director(request, mitigation):
+                return Response({
+                    "detail": "Department directors can only manage mitigation actions in their own department.",
+                    "status": status.HTTP_403_FORBIDDEN,
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            if is_dept_director and _normalize_status_token(mitigation.status) in {MITIGATION_REVIEWABLE_STATUS, MITIGATION_APPROVED_STATUS}:
+                return Response({
+                    "detail": "This mitigation action is locked while it is under risk review or already approved.",
+                    "status": status.HTTP_400_BAD_REQUEST,
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            if is_dept_director and requested_status == MITIGATION_APPROVED_STATUS:
+                return Response({
+                    "detail": "Department directors cannot approve mitigation actions.",
+                    "status": status.HTTP_403_FORBIDDEN,
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            if is_risk_dept and requested_status == "IN_PROGRESS" and _normalize_status_token(mitigation.status) == MITIGATION_REVIEWABLE_STATUS:
+                if not str(request.data.get("notes", "") or "").strip():
+                    return Response({
+                        "errors": {"notes": ["A decline comment is required."]},
+                    }, status=status.HTTP_400_BAD_REQUEST)
+
+            if is_risk_dept and requested_status == MITIGATION_APPROVED_STATUS and _normalize_status_token(mitigation.status) != MITIGATION_REVIEWABLE_STATUS:
+                return Response({
+                    "detail": "Only mitigation actions pending risk review can be approved.",
+                    "status": status.HTTP_400_BAD_REQUEST,
+                }, status=status.HTTP_400_BAD_REQUEST)
+
             old_mitigation = Mitigation.objects.get(id=pk)
             serializer = MitigationSerializer(instance = mitigation, data = request.data, partial = True)
             if serializer.is_valid():
                 updated_mitigation = serializer.save()
                 notify_mitigation_update(old_mitigation, updated_mitigation)
+
+                actor = _request_actor_label(request)
+                if is_risk_dept and requested_status == MITIGATION_APPROVED_STATUS:
+                    _log_mitigation_activity(
+                        updated_mitigation,
+                        actor,
+                        "Mitigation action approved",
+                        notes=str(request.data.get("notes", "") or "").strip(),
+                    )
+                    _advance_risk_to_committee_review_2_if_ready(updated_mitigation.risk, actor)
+                elif is_risk_dept and requested_status == "IN_PROGRESS" and _normalize_status_token(old_mitigation.status) == MITIGATION_REVIEWABLE_STATUS:
+                    _ensure_mitigation_risk_in_progress(
+                        updated_mitigation,
+                        actor,
+                        notes="Mitigation work resumed after a risk department decline.",
+                    )
+                    _log_mitigation_activity(
+                        updated_mitigation,
+                        actor,
+                        "Mitigation action declined",
+                        notes=str(request.data.get("notes", "") or "").strip(),
+                    )
+                elif is_dept_director:
+                    _log_mitigation_activity(
+                        updated_mitigation,
+                        actor,
+                        "Mitigation action updated",
+                        notes=str(request.data.get("notes", "") or "").strip(),
+                        activity_type="UPDATE",
+                    )
+
                 return Response({
                     "data":serializer.data,
-                    "status":status.HTTP_201_CREATED
-                })
+                    "status":status.HTTP_200_OK
+                }, status=status.HTTP_200_OK)
             else:
                 return Response({
                     "errors":serializer.errors
-                })
+                }, status=status.HTTP_400_BAD_REQUEST)
         else:
             return Response({
                 "data":"Bunday ma'lumot topilmadi",
                 "status":status.HTTP_404_NOT_FOUND
-            })
+            }, status=status.HTTP_404_NOT_FOUND)
             
             
 class StaffRiskMitigationCRYDView(APIView):
+    permission_classes = [IsAuthenticated]
     
     @swagger_auto_schema(request_body=MitigationSerializer, tags = ['Mitigation'])
     def patch(self, request, pk, *args, **kwargs):
-        mitigation = Mitigation.objects.get(id = pk)
+        mitigation = Mitigation.objects.select_related("risk", "risk__responsible_department_id", "risk__department").get(id = pk)
         if mitigation:
+            if not _is_mitigation_owner(request, mitigation):
+                return Response({
+                    "detail": "Only the assigned mitigation owner can update this action.",
+                    "status": status.HTTP_403_FORBIDDEN,
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            if _normalize_status_token(mitigation.status) in {MITIGATION_REVIEWABLE_STATUS, MITIGATION_APPROVED_STATUS}:
+                return Response({
+                    "detail": "This mitigation action cannot be edited while it is under review or already approved.",
+                    "status": status.HTTP_400_BAD_REQUEST,
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            requested_status = _normalize_status_token(request.data.get("status"))
+            if requested_status and requested_status not in MITIGATION_PERFORMER_EDITABLE_STATUSES | {MITIGATION_REVIEWABLE_STATUS}:
+                return Response({
+                    "detail": "Assigned staff can only move mitigation actions to In Progress or Pending Risk Review.",
+                    "status": status.HTTP_400_BAD_REQUEST,
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            if requested_status == MITIGATION_REVIEWABLE_STATUS and not str(request.data.get("notes", "") or "").strip():
+                return Response({
+                    "errors": {"notes": ["A completion comment is required before sending mitigation for review."]},
+                }, status=status.HTTP_400_BAD_REQUEST)
+
             old_mitigation = Mitigation.objects.get(id=pk)
             serializer = MitigationSerializer(instance = mitigation, data = request.data, partial = True)
             if serializer.is_valid():
                 updated_mitigation = serializer.save()
                 notify_mitigation_update(old_mitigation, updated_mitigation)
+
+                actor = _request_actor_label(request)
+                if requested_status == MITIGATION_REVIEWABLE_STATUS:
+                    _ensure_mitigation_risk_in_progress(
+                        updated_mitigation,
+                        actor,
+                        notes="Mitigation action submitted for risk department review.",
+                    )
+                    _log_mitigation_activity(
+                        updated_mitigation,
+                        actor,
+                        "Mitigation action submitted for review",
+                        notes=str(request.data.get("notes", "") or "").strip(),
+                    )
+                elif requested_status in MITIGATION_PERFORMER_EDITABLE_STATUSES:
+                    _ensure_mitigation_risk_in_progress(
+                        updated_mitigation,
+                        actor,
+                        notes="Mitigation work updated.",
+                    )
+                    _log_mitigation_activity(
+                        updated_mitigation,
+                        actor,
+                        "Mitigation action updated",
+                        notes=str(request.data.get("notes", "") or "").strip(),
+                        activity_type="UPDATE",
+                    )
+
                 return Response({
                     "data":serializer.data,
-                    "status":status.HTTP_201_CREATED
-                })
+                    "status":status.HTTP_200_OK
+                }, status=status.HTTP_200_OK)
             else:
                 return Response({
                     "errors":serializer.errors
-                })
+                }, status=status.HTTP_400_BAD_REQUEST)
         else:
             return Response({
                 "data":"Bunday ma'lumot topilmadi",
                 "status":status.HTTP_404_NOT_FOUND
-            })
+            }, status=status.HTTP_404_NOT_FOUND)
             
             
 class GetRiskMitigationView(APIView):
-    # permission_classes = [IsAuthenticated, ]
+    permission_classes = [IsAuthenticated]
     
     @swagger_auto_schema(tags = ['Filters'])
     def get(self, request, pk, *args, **kwargs):
-        mitigations = Mitigation.objects.filter(risk_id = pk)
+        mitigations = [
+            item for item in Mitigation.objects.select_related("risk", "risk__responsible_department_id", "risk__department").filter(risk_id = pk)
+            if _can_view_mitigation(request, item)
+        ]
         serializer = MitigationSerializer(mitigations, many =True)
         return Response({
             "data":serializer.data,
@@ -836,7 +1372,12 @@ class UpdateRiskView(APIView):
     @swagger_auto_schema(request_body=RiskSerializer, tags=["Risk"])
     def put(self, request, pk):
         risk = get_object_or_404(Risk, pk=pk)
-        serializer = RiskSerializer(risk, data=request.data, partial=True)
+        serializer = RiskSerializer(
+            risk,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
 
         if serializer.is_valid():
             updated_risk = serializer.save()
@@ -958,5 +1499,114 @@ class MeView(APIView):
         # Keycloak'dan kelgan qo'shimcha ma'lumotlar
         user_data["roles"] = payload.get("realm_access", {}).get("roles", [])
         user_data["keycloak_id"] = payload.get("sub")
+        user_data["groups"] = get_user_group_paths(payload)
+
+        try:
+            department = resolve_user_department(payload, sync=True)
+            user_data["department_id"] = department.id if department else None
+            user_data["department_name"] = department.name if department else None
+            user_data["department"] = (
+                DepartmentSerializer(department).data if department else None
+            )
+        except DepartmentResolutionError as exc:
+            user_data["department_id"] = None
+            user_data["department_name"] = None
+            user_data["department"] = None
+            user_data["department_error"] = str(exc)
 
         return Response(user_data)
+
+
+class DepartmentMemberDirectoryView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if not has_logical_role(request, "dept-director"):
+            return Response({
+                "detail": "Only department directors can view department members.",
+                "status": status.HTTP_403_FORBIDDEN,
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        payload = request.auth or {}
+
+        try:
+            department = resolve_user_department(payload, sync=True)
+        except DepartmentResolutionError as exc:
+            return Response({
+                "detail": str(exc),
+                "status": status.HTTP_400_BAD_REQUEST,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if department is None:
+            return Response({
+                "detail": "Unable to determine your department from Keycloak groups.",
+                "status": status.HTTP_400_BAD_REQUEST,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if not department.keycloak_group_id:
+            sync_departments_from_keycloak(force=True)
+            department.refresh_from_db()
+
+        if not department.keycloak_group_id:
+            return Response({
+                "detail": "The current department is not linked to a Keycloak group.",
+                "status": status.HTTP_400_BAD_REQUEST,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            members = _fetch_group_members(department.keycloak_group_id)
+        except DepartmentResolutionError as exc:
+            return Response({
+                "detail": str(exc),
+                "status": status.HTTP_400_BAD_REQUEST,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        request_identities = _request_identity_candidates(request)
+        seen_usernames = set()
+        directory_members = []
+
+        for member in members:
+            username = str(member.get("username") or "").strip()
+            email = str(member.get("email") or "").strip()
+            keycloak_id = str(member.get("id") or "").strip()
+
+            if not username or username.startswith("service-account-"):
+                continue
+
+            member_identities = {
+                _normalize_identity_value(username),
+                _normalize_identity_value(email),
+                _normalize_identity_value(keycloak_id),
+            }
+            member_identities.discard("")
+
+            if request_identities & member_identities:
+                continue
+
+            normalized_username = _normalize_identity_value(username)
+            if normalized_username in seen_usernames:
+                continue
+
+            seen_usernames.add(normalized_username)
+            directory_members.append({
+                "id": keycloak_id or username,
+                "keycloak_id": keycloak_id or None,
+                "username": username,
+                "email": email,
+                "first_name": str(member.get("firstName") or "").strip(),
+                "last_name": str(member.get("lastName") or "").strip(),
+                "full_name": _directory_member_label(member),
+                "name": _directory_member_label(member),
+                "department_id": department.id,
+                "department_name": department.name,
+                "department": DepartmentSerializer(department).data,
+                "is_active": bool(member.get("enabled", True)),
+            })
+
+        directory_members.sort(key=lambda item: item["name"].lower())
+
+        return Response({
+            "data": directory_members,
+            "status": status.HTTP_200_OK,
+        })
+

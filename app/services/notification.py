@@ -13,15 +13,26 @@ def resolve_user(user):
     return User.objects.filter(username=user).first()
 
 
-def create_notification(user, title, message, obj):
+def get_notification_username(user):
     if not user:
+        return None
+
+    if isinstance(user, User):
+        return user.username
+
+    return str(user)
+
+
+def create_notification(user, title, message, obj):
+    username = get_notification_username(user)
+    if not username or not obj:
         return
 
     Notification.objects.create(
-        user=user,
+        user=username,
         title=title,
-        message=message,
-        content_type=obj.__class__.__name__,
+        note=message,
+        container=obj.__class__.__name__,
         object_id=obj.id
     )
 
@@ -49,7 +60,7 @@ def notify_risk_update(old_risk, new_risk):
         )
 
     if new_risk.responsible_department_id:
-        director = new_risk.responsible_department_id.director
+        director = getattr(new_risk.responsible_department_id, "director", None)
 
         if director and director != new_risk.responsible:
             create_notification(
@@ -145,9 +156,9 @@ def create_notification_chat(user, title, message, obj=None):
         return None
 
     return Notification.objects.create(
-        user=user_obj,
+        user=user_obj.username,
         title=title,
-        message=message,
-        content_type=obj.__class__.__name__ if obj else None,
-        object_id=obj.id if obj else None
+        note=message,
+        container=obj.__class__.__name__ if obj else "",
+        object_id=obj.id if obj else 0
     )
