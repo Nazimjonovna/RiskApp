@@ -16,6 +16,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_list(name: str, default=None):
+    if default is None:
+        default = []
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return [item.strip() for item in value.split(",") if item.strip()]
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -27,9 +43,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.getenv("SECRET_KEY")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = env_bool("DEBUG", False)
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = env_list(
+    "ALLOWED_HOSTS",
+    default=["localhost", "127.0.0.1", "172.16.55.9"],
+)
 
 # Keycloak config
 KEYCLOAK_SERVER_URL = os.getenv("OIDC_SERVER_URL", "http://localhost:8080")
@@ -139,6 +158,8 @@ DATABASES = {
         "PASSWORD": os.getenv("DB_PASSWORD"),
         "HOST": os.getenv("DB_HOST"),
         "PORT": os.getenv("DB_PORT"),                    # Default PostgreSQL port
+        "CONN_MAX_AGE": int(os.getenv("DB_CONN_MAX_AGE", "60")),
+        "CONN_HEALTH_CHECKS": env_bool("DB_CONN_HEALTH_CHECKS", True),
     }
 }
 
@@ -188,12 +209,33 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 MEDIA_URL = '/images/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'images')
 
-CORS_ALLOW_ALL_ORIGINS = True
-CSRF_TRUSTED_ORIGINS = [
-    'http://localhost:8000',
-    'http://127.0.0.1:8000', 
-    'http://172.16.55.9:8000',
-    'http://172.16.55.9:3000',
-    'http://172.16.55.9:3030'
-]
+CORS_ALLOW_ALL_ORIGINS = env_bool("CORS_ALLOW_ALL_ORIGINS", False)
+CORS_ALLOWED_ORIGINS = env_list(
+    "CORS_ALLOWED_ORIGINS",
+    default=[
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://172.16.55.9:3000',
+        'http://172.16.55.9:3030',
+    ],
+)
+CSRF_TRUSTED_ORIGINS = env_list(
+    "CSRF_TRUSTED_ORIGINS",
+    default=[
+        'http://localhost:8000',
+        'http://127.0.0.1:8000',
+        'http://172.16.55.9:8000',
+        'http://172.16.55.9:3000',
+        'http://172.16.55.9:3030',
+    ],
+)
+
+USE_X_FORWARDED_HOST = env_bool("USE_X_FORWARDED_HOST", False)
+USE_X_FORWARDED_PORT = env_bool("USE_X_FORWARDED_PORT", False)
+SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT", False)
+SESSION_COOKIE_SECURE = env_bool("SESSION_COOKIE_SECURE", False)
+CSRF_COOKIE_SECURE = env_bool("CSRF_COOKIE_SECURE", False)
+
+if env_bool("USE_SECURE_PROXY_SSL_HEADER", False):
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
