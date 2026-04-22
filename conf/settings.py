@@ -96,9 +96,10 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'channels',
     'drf_yasg',
     "corsheaders",
-    "app",
+    "app.apps.AppConfig",
     "rest_framework",
     "mozilla_django_oidc",
 ]
@@ -117,6 +118,7 @@ SWAGGER_SETTINGS = {
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'django.middleware.gzip.GZipMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     "corsheaders.middleware.CorsMiddleware",
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -145,6 +147,32 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'conf.wsgi.application'
+ASGI_APPLICATION = 'conf.asgi.application'
+
+REDIS_URL = os.getenv("REDIS_URL")
+if REDIS_URL:
+    CHANNEL_LAYER_BACKEND = "channels_redis.core.RedisChannelLayer"
+    CHANNEL_LAYER_CONFIG = {
+        "hosts": [REDIS_URL],
+    }
+else:
+    CHANNEL_LAYER_BACKEND = "channels.layers.InMemoryChannelLayer"
+    CHANNEL_LAYER_CONFIG = {}
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": CHANNEL_LAYER_BACKEND,
+        "CONFIG": CHANNEL_LAYER_CONFIG,
+    }
+}
+
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "rms-in-memory-cache",
+        "TIMEOUT": 300,
+    }
+}
 
 
 # Database
@@ -238,4 +266,3 @@ CSRF_COOKIE_SECURE = env_bool("CSRF_COOKIE_SECURE", False)
 
 if env_bool("USE_SECURE_PROXY_SSL_HEADER", False):
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-

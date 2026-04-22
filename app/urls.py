@@ -6,7 +6,7 @@ from .views import (DepartmentView, DepartmentCRUDView, CategoryView, CategoryCR
                     FilterRiskByStatusView, UpcomingRiskAPIView,ReplyRiskActivityCRUDView,
                     ReplyRiskActivityCreateView, UpdateRiskView, AssignRiskView, AddRecipientToRiskView,
                     RiskCloseView, MeView, GetTokenView, UserRiskCrudView, StaffRiskMitigationCRYDView,
-                    DepartmentMemberDirectoryView)
+                    DepartmentMemberDirectoryView, AdminReportsAPIView)
 
 
 urlpatterns = [
@@ -35,6 +35,7 @@ urlpatterns = [
      path("api/risk/<int:pk>/assign/", AssignRiskView.as_view()), # for add user(kim bo'lsa ham) to rick general chat
      path("api/risk/<int:pk>/add-recipient/", AddRecipientToRiskView.as_view()),  # yangi
      path('api/risk/close/<int:pk>/', RiskCloseView.as_view()), #id risk.id userni requestdan olaman
+     path('api/reports/', AdminReportsAPIView.as_view()),
      path("token/", GetTokenView.as_view()),
      path("me/", MeView.as_view()),
      path("api/directory/department-members/", DepartmentMemberDirectoryView.as_view()),

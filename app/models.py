@@ -212,6 +212,17 @@ class Risk(models.Model):
         self.risk_number = self.build_risk_number()
         return super().save(update_fields=["risk_number"])
 
+    class Meta:
+        indexes = [
+            models.Index(fields=["status"]),
+            models.Index(fields=["due_date"]),
+            models.Index(fields=["created_by_user_id"]),
+            models.Index(fields=["responsible"]),
+            models.Index(fields=["responsible_department_id"]),
+            models.Index(fields=["updated_at"]),
+            models.Index(fields=["status", "due_date"]),
+        ]
+
     def __str__(self):
         return f"{self.id} - {self.title}"
 
@@ -246,6 +257,12 @@ class Mitigation(models.Model):
 
     class Meta:
         ordering = ["created_at", "id"]
+        indexes = [
+            models.Index(fields=["risk", "status"]),
+            models.Index(fields=["owner"]),
+            models.Index(fields=["status"]),
+            models.Index(fields=["updated_at"]),
+        ]
 
     def __str__(self):
         return f"{self.risk.id} - {self.title}"
@@ -273,6 +290,10 @@ class RiskDecition(models.Model):
 
     class Meta:
         ordering = ["-decided_at"]
+        indexes = [
+            models.Index(fields=["risk", "decition_type"]),
+            models.Index(fields=["decided_at"]),
+        ]
 
     def __str__(self):
         return f"{self.risk.id} - {self.decition_type}"
@@ -355,6 +376,13 @@ class Notification(models.Model):
     object_id = models.IntegerField()
     created_at = models.DateTimeField(auto_now=True)
     is_read = models.BooleanField(default=False)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["user", "is_read"]),
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["container", "object_id"]),
+        ]
     
     def __str__(self):
         return f'{self.container} ---- {self.object_id} ---- {self.created_at}'

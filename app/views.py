@@ -1,13 +1,20 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
+import csv
+from collections import defaultdict
+import os
 import re
+from io import StringIO
+from django.http import HttpResponse
 from django.utils import timezone
+from django.db.models import Q, Subquery
+from django.utils.dateparse import parse_datetime as _parse_datetime
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 import requests
+from django.core.cache import cache
 from django.conf import settings
 from django.shortcuts import get_object_or_404
-from django.db.models import Prefetch
 from .services.risk_activity import create_risk_activity_and_notify, add_user_to_risk_activity
 from .services.notification import notify_risk_update, notify_mitigation_update, notify_mitigation_create
 from rest_framework.permissions import IsAuthenticated, AllowAny
@@ -85,6 +92,102 @@ DEPARTMENT_ALIASES = {
     "ucmg": {"ucmg"},
 }
 
+REFERENCE_LIST_CACHE_TTL = int(os.getenv("RISK_REFERENCE_CACHE_TTL", "300"))
+DEPARTMENT_REFERENCE_LIST_CACHE_KEY = "rms:departments:list:v1"
+CATEGORY_REFERENCE_LIST_CACHE_KEY = "rms:categories:list:v1"
+DEPARTMENT_SCOPE_INDEX_CACHE_KEY = "rms:department-scope-index:v1"
+DEPARTMENT_SCOPE_INDEX_TTL = int(os.getenv("DEPARTMENT_SCOPE_INDEX_TTL_SECONDS", "300"))
+ME_PROFILE_CACHE_TTL = int(os.getenv("ME_PROFILE_CACHE_TTL_SECONDS", "60"))
+ME_PROFILE_CACHE_KEY = "rms:me-profile:{user_id}"
+DIRECTORY_MEMBERS_CACHE_TTL = int(os.getenv("DEPARTMENT_MEMBERS_CACHE_TTL_SECONDS", "120"))
+DIRECTORY_MEMBERS_CACHE_KEY = "rms:department-members:{department_id}"
+DEFAULT_LIST_PAGE_SIZE = int(os.getenv("RISK_LIST_DEFAULT_PAGE_SIZE", "0"))
+MAX_LIST_PAGE_SIZE = int(os.getenv("RISK_LIST_MAX_PAGE_SIZE", "250"))
+
+ADMIN_REPORT_TYPE_CHOICES = {
+    "risk-register",
+    "status-summary",
+    "department-summary",
+    "decision-log",
+}
+
+ADMIN_REPORT_COLUMNS = {
+    "risk-register": [
+        {"key": "id", "label": "ID"},
+        {"key": "title", "label": "Risk"},
+        {"key": "department", "label": "Department"},
+        {"key": "category", "label": "Category"},
+        {"key": "status", "label": "Status"},
+        {"key": "owner", "label": "Owner"},
+        {"key": "responsible", "label": "Responsible"},
+        {"key": "expectedLoss", "label": "Expected Loss"},
+        {"key": "updatedAt", "label": "Updated"},
+    ],
+    "status-summary": [
+        {"key": "status", "label": "Status"},
+        {"key": "count", "label": "Risk count"},
+        {"key": "totalLoss", "label": "Total expected loss"},
+        {"key": "avgLoss", "label": "Avg expected loss"},
+    ],
+    "department-summary": [
+        {"key": "department", "label": "Department"},
+        {"key": "count", "label": "Risk count"},
+        {"key": "totalLoss", "label": "Total expected loss"},
+        {"key": "avgLoss", "label": "Avg expected loss"},
+    ],
+    "decision-log": [
+        {"key": "id", "label": "Decision ID"},
+        {"key": "riskId", "label": "Risk ID"},
+        {"key": "riskTitle", "label": "Risk"},
+        {"key": "type", "label": "Decision"},
+        {"key": "decidedBy", "label": "Decided By"},
+        {"key": "decidedAt", "label": "Date"},
+        {"key": "notes", "label": "Notes"},
+    ],
+}
+
+
+def _to_datetime_query_value(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    if raw.isdigit():
+        try:
+            seconds = float(raw)
+        except ValueError:
+            return None
+        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+
+    parsed = _parse_datetime(raw)
+    if parsed is None:
+        return None
+    if timezone.is_naive(parsed):
+        return timezone.make_aware(parsed, timezone.get_current_timezone())
+    return parsed
+
+
+def _get_updated_since(request):
+    raw = request.query_params.get("updated_since")
+    if raw is None:
+        raw = request.query_params.get("since")
+    if raw is None:
+        return None
+    return _to_datetime_query_value(raw)
+
+
+def _apply_updated_since_filter(queryset, request, field_name):
+    since = _get_updated_since(request)
+    if not since:
+        return queryset
+    return queryset.filter(**{f"{field_name}__gt": since})
+
 
 def _normalize_identity_value(value):
     return str(value or "").strip().lower()
@@ -124,13 +227,17 @@ def _canonical_department_key(value):
     return normalized
 
 
-def _request_identity_candidates(request):
+def _get_request_context(request):
+    context = getattr(request, "_rms_request_context", None)
+    if context is not None:
+        return context
+
     payload = request.auth or {}
     user = request.user
     given_name = str(payload.get("given_name") or "").strip()
     family_name = str(payload.get("family_name") or "").strip()
     full_name = " ".join(part for part in [given_name, family_name] if part).strip()
-    values = [
+    identity_values = [
         payload.get("preferred_username"),
         payload.get("email"),
         payload.get("name"),
@@ -142,27 +249,143 @@ def _request_identity_candidates(request):
         getattr(user, "id", None),
     ]
 
-    return {
+    identity_candidates = {
         _normalize_identity_value(value)
-        for value in values
+        for value in identity_values
         if value is not None and _normalize_identity_value(value)
     }
 
+    department_values = [
+        payload.get("department"),
+        payload.get("dept"),
+        payload.get("org_unit"),
+        payload.get("organization"),
+        payload.get("division"),
+    ]
+    group_paths = get_user_group_paths(payload)
+    department_values.extend(group_paths)
+    department_values.extend(
+        path.rsplit("/", 1)[-1]
+        for path in group_paths
+        if isinstance(path, str) and path.strip()
+    )
 
-def _is_risk_creator(request, risk):
+    try:
+        department = resolve_user_department(payload, sync=False)
+    except DepartmentResolutionError:
+        department = None
+
+    if department:
+        department_values.extend(_department_identity_candidates(department))
+
+    department_candidates = set()
+    for value in department_values:
+        normalized = _normalize_identity_value(value)
+        canonical = canonical_department_key(value)
+        if normalized:
+            department_candidates.add(normalized)
+        if canonical:
+            department_candidates.add(canonical)
+
+    context = {
+        "identity_candidates": identity_candidates,
+        "department_candidates": department_candidates,
+        "actor_label": (
+            payload.get("preferred_username")
+            or getattr(user, "username", None)
+            or payload.get("email")
+            or "System"
+        ),
+        "can_view_all_risks": has_any_logical_role(
+            request,
+            ["super-admin", "risk-dept", "risk-committee"],
+        ),
+        "is_dept_director": has_logical_role(request, "dept-director"),
+        "is_risk_dept_or_committee": has_any_logical_role(request, ["risk-dept", "risk-committee"]),
+        "is_risk_dept": has_logical_role(request, "risk-dept"),
+    }
+
+    request._rms_request_context = context
+    return context
+
+
+def _request_identity_candidates(request):
+    return _get_request_context(request)["identity_candidates"]
+
+
+def _parse_positive_int(value, default=0, max_value=None):
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+    if parsed < 1:
+        return default
+
+    if max_value and parsed > max_value:
+        return max_value
+
+    return parsed
+
+
+def _is_pagination_requested(request):
+    params = request.query_params
+    return ("page" in params) or ("page_size" in params) or (params.get("paginate") == "1")
+
+
+def _get_pagination_params(request):
+    if not _is_pagination_requested(request):
+        return None
+
+    page = _parse_positive_int(request.query_params.get("page"), 1)
+    page_size = _parse_positive_int(
+        request.query_params.get("page_size"),
+        DEFAULT_LIST_PAGE_SIZE or 50,
+        MAX_LIST_PAGE_SIZE,
+    )
+    include_count = request.query_params.get("include_count", "1") != "0"
+
+    return {
+        "page": page,
+        "page_size": page_size,
+        "include_count": include_count,
+    }
+
+
+def _paginate_queryset(queryset, request):
+    pagination = _get_pagination_params(request)
+    if not pagination:
+        return {"count": None, "results": list(queryset), "next": None, "previous": None}
+
+    page = pagination["page"]
+    page_size = pagination["page_size"]
+    include_count = pagination["include_count"]
+    offset = (page - 1) * page_size
+    sliced = queryset[offset : offset + page_size + 1]
+    values = list(sliced)
+    has_more = len(values) > page_size
+    next_page = page + 1 if has_more else None
+    if has_more:
+        values = values[:page_size]
+
+    return {
+        "count": queryset.count() if include_count else None,
+        "next": next_page,
+        "previous": page - 1 if page > 1 else None,
+        "results": values,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+def _is_risk_creator(request, risk, request_context=None):
     creator_value = _normalize_identity_value(getattr(risk, "created_by_user_id", ""))
-    return bool(creator_value) and creator_value in _request_identity_candidates(request)
+    identities = (request_context or _get_request_context(request))["identity_candidates"]
+    return bool(creator_value) and creator_value in identities
 
 
 def _request_actor_label(request):
-    payload = request.auth or {}
-    user = request.user
-    return (
-        payload.get("preferred_username")
-        or getattr(user, "username", None)
-        or payload.get("email")
-        or "System"
-    )
+    return _get_request_context(request)["actor_label"]
 
 
 def _directory_member_label(member):
@@ -183,39 +406,7 @@ def _directory_member_label(member):
 
 
 def _request_department_candidates(request):
-    payload = request.auth or {}
-    values = [
-        payload.get("department"),
-        payload.get("dept"),
-        payload.get("org_unit"),
-        payload.get("organization"),
-        payload.get("division"),
-    ]
-    group_paths = get_user_group_paths(payload)
-    values.extend(group_paths)
-    values.extend(
-        path.rsplit("/", 1)[-1]
-        for path in group_paths
-        if isinstance(path, str) and path.strip()
-    )
-
-    try:
-        department = resolve_user_department(payload, sync=False)
-    except DepartmentResolutionError:
-        department = None
-
-    if department:
-        values.extend(_department_identity_candidates(department))
-
-    candidates = set()
-    for value in values:
-        normalized = _normalize_identity_value(value)
-        canonical = canonical_department_key(value)
-        if normalized:
-            candidates.add(normalized)
-        if canonical:
-            candidates.add(canonical)
-    return candidates
+    return set(_get_request_context(request)["department_candidates"])
 
 
 def _department_identity_candidates(department):
@@ -239,20 +430,39 @@ def _department_identity_candidates(department):
     return candidates
 
 
-def _is_risk_related_department_director(request, risk):
-    if not has_logical_role(request, "dept-director"):
+def _get_department_scope_index():
+    cached_payload = cache.get(DEPARTMENT_SCOPE_INDEX_CACHE_KEY)
+    if isinstance(cached_payload, dict):
+        return {
+            key: set(department_ids)
+            for key, department_ids in cached_payload.items()
+            if isinstance(department_ids, (list, tuple, set))
+        }
+
+    department_index = {}
+    departments = Department.objects.filter(is_active=True).only("id", "name", "keycloak_path")
+    for department in departments:
+        candidates = _department_identity_candidates(department)
+        for candidate in candidates:
+            if not candidate:
+                continue
+            department_ids = department_index.setdefault(candidate, set())
+            department_ids.add(department.id)
+
+    cache.set(
+        DEPARTMENT_SCOPE_INDEX_CACHE_KEY,
+        {key: sorted(value) for key, value in department_index.items()},
+        DEPARTMENT_SCOPE_INDEX_TTL,
+    )
+    return department_index
+
+
+def _is_risk_related_department_director(request, risk, request_context=None):
+    request_context = request_context or _get_request_context(request)
+    if not request_context["is_dept_director"]:
         return False
 
-    request_departments = _request_department_candidates(request)
-
-    try:
-        request_department = resolve_user_department(request.auth or {}, sync=False)
-    except DepartmentResolutionError:
-        request_department = None
-
-    if request_department:
-        request_departments.update(_department_identity_candidates(request_department))
-
+    request_departments = request_context["department_candidates"]
     risk_departments = set()
     prioritized_departments = [
         getattr(risk, "responsible_department_id", None),
@@ -266,64 +476,369 @@ def _is_risk_related_department_director(request, risk):
     return bool(request_departments & risk_departments)
 
 
-def _has_risk_mitigation_assignment(request, risk):
-    identities = _request_identity_candidates(request)
+def _has_risk_mitigation_assignment(request, risk, request_context=None):
+    identities = (request_context or _get_request_context(request))["identity_candidates"]
     if not identities:
         return False
 
-    for mitigation in getattr(risk, "mitigations", []).all():
-        if _normalize_identity_value(mitigation.owner) in identities:
-            return True
-
-    return False
-
-
-def _can_view_risk(request, risk):
-    if has_any_logical_role(request, ["super-admin", "risk-dept", "risk-committee"]):
-        return True
-
-    if _is_risk_creator(request, risk):
-        return True
-
-    if _normalize_identity_value(getattr(risk, "responsible", "")) in _request_identity_candidates(request):
-        return True
-
-    if _is_risk_related_department_director(request, risk):
-        return True
-
-    if _has_risk_mitigation_assignment(request, risk):
-        return True
-
-    return False
+    return Mitigation.objects.filter(
+        risk_id=getattr(risk, "id", None),
+        owner__in=identities,
+    ).exists()
 
 
-def _scoped_risk_queryset():
-    return Risk.objects.select_related(
-        "department",
-        "category",
-        "responsible_department_id",
-    ).prefetch_related(
-        Prefetch("mitigations", queryset=Mitigation.objects.only("id", "risk_id", "owner"))
-    )
+def _department_ids_for_request(request_context):
+    cached_department_ids = request_context.get("_department_ids")
+    if cached_department_ids is not None:
+        return cached_department_ids
+
+    department_candidates = set(request_context.get("department_candidates", ()))
+    if not department_candidates:
+        request_context["_department_ids"] = set()
+        return set()
+
+    scope_index = _get_department_scope_index()
+    department_ids = set()
+    for candidate in department_candidates:
+        department_ids.update(scope_index.get(candidate, set()))
+
+    request_context["_department_ids"] = department_ids
+    return department_ids
 
 
 def _get_scoped_risks_for_request(request):
-    risks = _scoped_risk_queryset()
-    if has_any_logical_role(request, ["super-admin", "risk-dept", "risk-committee"]):
-        return risks
-    return [risk for risk in risks if _can_view_risk(request, risk)]
+    return _scoped_risk_queryset(request)
 
 
-def _is_mitigation_owner(request, mitigation):
-    return _normalize_identity_value(getattr(mitigation, "owner", "")) in _request_identity_candidates(request)
+def _can_view_risk(request, risk, request_context=None):
+    context = request_context or _get_request_context(request)
+    if context["can_view_all_risks"]:
+        return True
+
+    if _is_risk_creator(request, risk, context):
+        return True
+
+    if _normalize_identity_value(getattr(risk, "responsible", "")) in context["identity_candidates"]:
+        return True
+
+    if _is_risk_related_department_director(request, risk, context):
+        return True
+
+    if _has_risk_mitigation_assignment(request, risk, context):
+        return True
+
+    return False
 
 
-def _is_mitigation_department_director(request, mitigation):
-    return _is_risk_related_department_director(request, mitigation.risk)
+def _scoped_risk_queryset(request, request_context=None):
+    request_context = request_context or _get_request_context(request)
+    department_ids = _department_ids_for_request(request_context)
+
+    queryset = Risk.objects.select_related(
+        "department",
+        "category",
+        "responsible_department_id",
+    )
+
+    if request_context["can_view_all_risks"]:
+        return queryset
+
+    identities = request_context["identity_candidates"]
+    access_filter = Q(created_by_user_id__in=identities) | Q(responsible__in=identities)
+    if department_ids:
+        access_filter |= Q(responsible_department_id__in=department_ids)
+
+    mitigation_risk_ids = Subquery(
+        Mitigation.objects.filter(owner__in=identities).values("risk_id")
+    )
+    access_filter |= Q(id__in=mitigation_risk_ids)
+
+    scoped = queryset.filter(access_filter).distinct()
+    return scoped
 
 
-def _can_view_mitigation(request, mitigation):
-    return _can_view_risk(request, mitigation.risk) or _is_mitigation_owner(request, mitigation)
+def _normalize_report_query(value):
+    return str(value or "").strip().lower()
+
+
+def _to_safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _safe_report_iso_datetime(value):
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    if timezone.is_naive(value):
+        return timezone.make_aware(value, timezone.get_current_timezone()).isoformat()
+    return value.isoformat()
+
+
+def _report_decision_display(value):
+    return dict(RiskDecition.DECITION_CHOICES).get(value, value or "")
+
+
+def _report_risk_status_display(value):
+    return dict(Risk.STATUS_CHOICES).get(value, value or "")
+
+
+def _report_department_name(risk):
+    department = risk.department or getattr(risk, "responsible_department_id", None)
+    if department is not None:
+        return department.name or ""
+    return ""
+
+
+def _build_report_risk_search_filter(query):
+    text = _normalize_report_query(query)
+    if not text:
+        return Q()
+
+    search_filter = (
+        Q(risk_number__icontains=text)
+        | Q(title__icontains=text)
+        | Q(status__icontains=text)
+        | Q(owner__icontains=text)
+        | Q(responsible__icontains=text)
+        | Q(department__name__icontains=text)
+        | Q(category__name__icontains=text)
+        | Q(responsible_department_id__name__icontains=text)
+    )
+
+    if text.isdigit():
+        search_filter |= Q(id=int(text))
+
+    return search_filter
+
+
+def _build_risk_register_rows(risk_queryset):
+    rows = []
+    for risk in risk_queryset:
+        rows.append({
+            "id": risk.risk_number or str(risk.id),
+            "title": risk.title or "",
+            "department": _report_department_name(risk),
+            "category": risk.category.name if getattr(risk, "category", None) else "",
+            "status": _report_risk_status_display(risk.status),
+            "owner": risk.owner or "",
+            "responsible": risk.responsible or "",
+            "expectedLoss": _to_safe_float(risk.possible_loss),
+            "updatedAt": _safe_report_iso_datetime(risk.updated_at),
+        })
+    return rows
+
+
+def _build_status_summary_rows(risks):
+    buckets = defaultdict(lambda: {"count": 0, "totalLoss": 0.0})
+
+    for risk in risks:
+        status = _report_risk_status_display(risk.status)
+        bucket = buckets[status]
+        bucket["count"] += 1
+        bucket["totalLoss"] += _to_safe_float(risk.possible_loss)
+
+    rows = []
+    for status, data in buckets.items():
+        total = data["totalLoss"]
+        count = data["count"]
+        rows.append({
+            "status": status,
+            "count": count,
+            "totalLoss": total,
+            "avgLoss": total / count if count else 0.0,
+        })
+
+    return sorted(rows, key=lambda item: item["count"], reverse=True)
+
+
+def _build_department_summary_rows(risks):
+    buckets = defaultdict(lambda: {"count": 0, "totalLoss": 0.0})
+
+    for risk in risks:
+        department = _report_department_name(risk) or "Not assigned"
+        bucket = buckets[department]
+        bucket["count"] += 1
+        bucket["totalLoss"] += _to_safe_float(risk.possible_loss)
+
+    rows = []
+    for department, data in buckets.items():
+        total = data["totalLoss"]
+        count = data["count"]
+        rows.append({
+            "department": department,
+            "count": count,
+            "totalLoss": total,
+            "avgLoss": total / count if count else 0.0,
+        })
+
+    return sorted(rows, key=lambda item: item["count"], reverse=True)
+
+
+def _build_decision_log_rows(decision_queryset):
+    rows = []
+    for decision in decision_queryset:
+        risk = decision.risk
+        rows.append({
+            "id": str(decision.id),
+            "riskId": str(getattr(risk, "id", "")),
+            "riskTitle": risk.title if risk else "",
+            "type": _report_decision_display(decision.decition_type),
+            "decidedBy": decision.decided_by or "",
+            "decidedAt": _safe_report_iso_datetime(decision.decided_at),
+            "notes": decision.notes or "",
+        })
+
+    return rows
+
+
+def _build_admin_report_payload(request, report_type, search_query=""):
+    scoped_risks = _scoped_risk_queryset(request)
+    now = timezone.now().isoformat()
+
+    if report_type == "risk-register":
+        filtered_risks = scoped_risks.filter(_build_report_risk_search_filter(search_query)).order_by(
+            "-updated_at",
+            "-id",
+        )
+        return {
+            "type": report_type,
+            "generatedAt": now,
+            "columns": ADMIN_REPORT_COLUMNS[report_type],
+            "rows": _build_risk_register_rows(filtered_risks),
+        }
+
+    if report_type == "status-summary":
+        rows = _build_status_summary_rows(scoped_risks)
+        return {
+            "type": report_type,
+            "generatedAt": now,
+            "columns": ADMIN_REPORT_COLUMNS[report_type],
+            "rows": rows,
+        }
+
+    if report_type == "department-summary":
+        rows = _build_department_summary_rows(scoped_risks)
+        return {
+            "type": report_type,
+            "generatedAt": now,
+            "columns": ADMIN_REPORT_COLUMNS[report_type],
+            "rows": rows,
+        }
+
+    visible_risk_ids = list(scoped_risks.values_list("id", flat=True))
+    decisions = (
+        RiskDecition.objects.select_related("risk")
+        .filter(risk_id__in=visible_risk_ids)
+        .order_by("-decided_at")
+    )
+    rows = _build_decision_log_rows(decisions)
+    return {
+        "type": report_type,
+        "generatedAt": now,
+        "columns": ADMIN_REPORT_COLUMNS[report_type],
+        "rows": rows,
+    }
+
+
+def _admin_report_csv_filename(report_type, generated_at):
+    prefix = report_type.replace("-", "_")
+    if isinstance(generated_at, str):
+        date_part = generated_at[:10]
+    else:
+        date_part = timezone.localtime(generated_at or timezone.now()).date().isoformat()
+    return f"{prefix}-{date_part}.csv"
+
+
+def _admin_report_csv_response(payload):
+    columns = payload["columns"]
+    rows = payload["rows"]
+    generated_at = payload.get("generatedAt")
+    report_type = payload["type"]
+
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=[column["key"] for column in columns], extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({
+            "id": row.get("id", ""),
+            "title": row.get("title", ""),
+            "department": row.get("department", ""),
+            "category": row.get("category", ""),
+            "status": row.get("status", ""),
+            "owner": row.get("owner", ""),
+            "responsible": row.get("responsible", ""),
+            "expectedLoss": row.get("expectedLoss", ""),
+            "updatedAt": row.get("updatedAt", ""),
+            "count": row.get("count", ""),
+            "totalLoss": row.get("totalLoss", ""),
+            "avgLoss": row.get("avgLoss", ""),
+            "riskId": row.get("riskId", ""),
+            "riskTitle": row.get("riskTitle", ""),
+            "type": row.get("type", ""),
+            "decidedBy": row.get("decidedBy", ""),
+            "decidedAt": row.get("decidedAt", ""),
+            "notes": row.get("notes", ""),
+        })
+
+    response = HttpResponse(f"\ufeff{output.getvalue()}", content_type="text/csv; charset=utf-8")
+    response["Content-Disposition"] = f'attachment; filename="{_admin_report_csv_filename(report_type, generated_at)}"'
+    response["Cache-Control"] = "no-store"
+    return response
+
+
+class AdminReportsAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @swagger_auto_schema(tags=["Reports"])
+    def get(self, request, *args, **kwargs):
+        if not has_logical_role(request, "super-admin"):
+            return Response({
+                "detail": "Only administrators can generate reports.",
+                "status": status.HTTP_403_FORBIDDEN,
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        report_type = _normalize_report_query(request.query_params.get("type"))
+        if not report_type:
+            return Response({
+                "detail": "The report type is required.",
+                "status": status.HTTP_400_BAD_REQUEST,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if report_type not in ADMIN_REPORT_TYPE_CHOICES:
+            return Response({
+                "detail": "Invalid report type.",
+                "status": status.HTTP_400_BAD_REQUEST,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        search_query = request.query_params.get("search", "")
+        payload = _build_admin_report_payload(request, report_type, search_query)
+        output_format = _normalize_report_query(request.query_params.get("format"))
+
+        if output_format == "csv":
+            return _admin_report_csv_response(payload)
+
+        return Response(payload)
+
+
+def _is_mitigation_owner(request, mitigation, request_context=None):
+    identities = (request_context or _get_request_context(request))["identity_candidates"]
+    return _normalize_identity_value(getattr(mitigation, "owner", "")) in identities
+
+
+def _is_mitigation_department_director(request, mitigation, request_context=None):
+    return _is_risk_related_department_director(request, mitigation.risk, request_context)
+
+
+def _can_view_mitigation(request, mitigation, request_context=None):
+    return _can_view_risk(request, mitigation.risk, request_context) or _is_mitigation_owner(
+        request,
+        mitigation,
+        request_context,
+    )
 
 
 def _ensure_mitigation_risk_in_progress(mitigation, actor, notes=""):
@@ -392,6 +907,36 @@ def _advance_risk_to_committee_review_2_if_ready(risk, actor):
     )
 
 
+def _get_department_reference_payload_from_cache():
+    payload = cache.get(DEPARTMENT_REFERENCE_LIST_CACHE_KEY)
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _set_department_reference_payload_cache(payload):
+    cache.set(DEPARTMENT_REFERENCE_LIST_CACHE_KEY, payload, REFERENCE_LIST_CACHE_TTL)
+
+
+def _get_category_reference_payload_from_cache():
+    payload = cache.get(CATEGORY_REFERENCE_LIST_CACHE_KEY)
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _set_category_reference_payload_cache(payload):
+    cache.set(CATEGORY_REFERENCE_LIST_CACHE_KEY, payload, REFERENCE_LIST_CACHE_TTL)
+
+
+def _invalidate_reference_list_caches():
+    cache.delete_many([
+        DEPARTMENT_REFERENCE_LIST_CACHE_KEY,
+        CATEGORY_REFERENCE_LIST_CACHE_KEY,
+        DEPARTMENT_SCOPE_INDEX_CACHE_KEY,
+    ])
+
+
 def _all_mitigation_actions_approved(risk):
     mitigations = list(risk.mitigations.all())
     if not mitigations:
@@ -421,6 +966,7 @@ class DepartmentView(APIView):
         serializer = DepartmentSerializer(data = request.data)
         if serializer.is_valid():
             instance = serializer.save()
+            _invalidate_reference_list_caches()
             return Response({
                 "data":serializer.data,
                 "status":status.HTTP_201_CREATED
@@ -432,6 +978,10 @@ class DepartmentView(APIView):
             
     @swagger_auto_schema(tags = ['Department'])
     def get(self, request, *args,**kwargs):
+        cached_response = _get_department_reference_payload_from_cache()
+        if cached_response is not None:
+            return Response(cached_response)
+
         try:
             departments = sync_departments_from_keycloak()
         except Exception:
@@ -442,10 +992,12 @@ class DepartmentView(APIView):
             if not departments.exists():
                 departments = Department.objects.filter(is_active=True).order_by("name")
         serializer = DepartmentSerializer(departments, many = True)
-        return Response({
+        response_payload = {
             "data":serializer.data,
             "status":status.HTTP_200_OK
-        })
+        }
+        _set_department_reference_payload_cache(response_payload)
+        return Response(response_payload)
         
 
 class DepartmentCRUDView(APIView):
@@ -470,6 +1022,7 @@ class DepartmentCRUDView(APIView):
         department = Department.objects.get(id = pk)
         if department:
             department.delete()
+            _invalidate_reference_list_caches()
             return Response({
                 "status":status.HTTP_200_OK
             })
@@ -485,6 +1038,7 @@ class DepartmentCRUDView(APIView):
             serializer = DepartmentSerializer(instance = department, data = request.data, partial = True)
             if serializer.is_valid():
                 serializer.save()
+                _invalidate_reference_list_caches()
                 return Response({
                     "data":serializer.data,
                     "status":status.HTTP_200_OK
@@ -507,6 +1061,7 @@ class CategoryView(APIView):
         serializer = CategorySerializer(data = request.data)
         if serializer.is_valid():
             instance = serializer.save()
+            _invalidate_reference_list_caches()
             return Response({
                 "data":serializer.data,
                 "status":status.HTTP_201_CREATED
@@ -518,12 +1073,18 @@ class CategoryView(APIView):
             
     @swagger_auto_schema(tags = ['Category'])
     def get(self, request, *args,**kwargs):
+        cached_response = _get_category_reference_payload_from_cache()
+        if cached_response is not None:
+            return Response(cached_response)
+
         departments = Category.objects.all()
         serializer = CategorySerializer(departments, many = True)
-        return Response({
+        response_payload = {
             "data":serializer.data,
             "status":status.HTTP_200_OK
-        })
+        }
+        _set_category_reference_payload_cache(response_payload)
+        return Response(response_payload)
         
 
 class CategoryCRUDView(APIView):
@@ -548,6 +1109,7 @@ class CategoryCRUDView(APIView):
         department = Category.objects.get(id = pk)
         if department:
             department.delete()
+            _invalidate_reference_list_caches()
             return Response({
                 "status":status.HTTP_200_OK
             })
@@ -563,6 +1125,7 @@ class CategoryCRUDView(APIView):
             serializer = CategorySerializer(instance = department, data = request.data, partial = True)
             if serializer.is_valid():
                 serializer.save()
+                _invalidate_reference_list_caches()
                 return Response({
                     "data":serializer.data,
                     "status":status.HTTP_200_OK
@@ -605,11 +1168,23 @@ class CreateRiskView(APIView):
             
     @swagger_auto_schema(tags = ['Risk'])
     def get(self, request, *args, **kwargs):
-        risk = _get_scoped_risks_for_request(request)
-        serializer = RiskSerializer(risk, many = True)
-        return Response({
-            "data":serializer.data
-        })
+        risk_query = _scoped_risk_queryset(request).order_by("-updated_at", "-id")
+        risk_query = _apply_updated_since_filter(risk_query, request, "updated_at")
+        paginated = _paginate_queryset(risk_query, request)
+        serializer = RiskSerializer(paginated["results"], many=True)
+        payload = {
+            "data": serializer.data,
+        }
+        if paginated["count"] is not None:
+            payload["syncedUntil"] = timezone.now().isoformat()
+            payload["pagination"] = {
+                "page": paginated["page"],
+                "pageSize": paginated["page_size"],
+                "count": paginated["count"],
+                "next": paginated["next"],
+                "previous": paginated["previous"],
+            }
+        return Response(payload)
         
         
 class RiskCRUDView(APIView):
@@ -815,12 +1390,28 @@ class CreateRiskActivityView(APIView):
             
     @swagger_auto_schema(tags = ['RiskActivity'])
     def get(self, request, *args, **kwargs):
-        visible_risk_ids = {risk.id for risk in _get_scoped_risks_for_request(request)}
-        riskactivity = RiskActivity.objects.filter(risk_id__in=visible_risk_ids)
-        serializer = RiskActivitySerializer(riskactivity, many = True)
-        return Response({
-            "data":serializer.data
-        })
+        visible_risk_ids = set(_get_scoped_risks_for_request(request).values_list("id", flat=True))
+        riskactivity = (
+            RiskActivity.objects.select_related("risk")
+            .filter(risk_id__in=visible_risk_ids)
+            .order_by("-at")
+        )
+        riskactivity = _apply_updated_since_filter(riskactivity, request, "at")
+        paginated = _paginate_queryset(riskactivity, request)
+        serializer = RiskActivitySerializer(paginated["results"], many=True)
+
+        payload = {"data": serializer.data}
+        if paginated["count"] is not None:
+            payload["syncedUntil"] = timezone.now().isoformat()
+            payload["pagination"] = {
+                "page": paginated["page"],
+                "pageSize": paginated["page_size"],
+                "count": paginated["count"],
+                "next": paginated["next"],
+                "previous": paginated["previous"],
+            }
+
+        return Response(payload)
         
         
 class RiskActivityCRUDView(APIView):
@@ -978,13 +1569,27 @@ class CreateRiskDecitionView(APIView):
             
     @swagger_auto_schema(tags = ['RiskDecition'])
     def get(self, request, *args, **kwargs):
-        visible_risk_ids = {risk.id for risk in _get_scoped_risks_for_request(request)}
-        decisition = RiskDecition.objects.filter(risk_id__in=visible_risk_ids)
-        serializer = RiskDecisionSerializer(decisition, many = True)
-        return Response({
-            "data":serializer.data,
-            "status":status.HTTP_200_OK
-        })
+        visible_risk_ids = set(_get_scoped_risks_for_request(request).values_list("id", flat=True))
+        decisition = (
+            RiskDecition.objects.filter(risk_id__in=visible_risk_ids)
+            .order_by("-decided_at")
+        )
+        decisition = _apply_updated_since_filter(decisition, request, "decided_at")
+        paginated = _paginate_queryset(decisition, request)
+        serializer = RiskDecisionSerializer(paginated["results"], many=True)
+        payload = {"data": serializer.data, "status": status.HTTP_200_OK}
+
+        if paginated["count"] is not None:
+            payload["syncedUntil"] = timezone.now().isoformat()
+            payload["pagination"] = {
+                "page": paginated["page"],
+                "pageSize": paginated["page_size"],
+                "count": paginated["count"],
+                "next": paginated["next"],
+                "previous": paginated["previous"],
+            }
+
+        return Response(payload)
         
         
 class RiskDecitionCRUDView(APIView):
@@ -1099,15 +1704,29 @@ class CreateMitigationView(APIView):
             
     @swagger_auto_schema(tags = ['Mitigation'])
     def get(self, request, *args, **kwargs):
-        mitigation = [
-            item for item in Mitigation.objects.select_related("risk", "risk__responsible_department_id", "risk__department").all()
-            if _can_view_mitigation(request, item)
-        ]
-        seralizer = MitigationSerializer(mitigation, many =True)
-        return Response({
-            "data":seralizer.data,
-            "status":status.HTTP_200_OK
-        })
+        risk_ids = _scoped_risk_queryset(request).values_list("id", flat=True)
+        mitigation = (
+            Mitigation.objects
+            .select_related("risk", "risk__responsible_department_id", "risk__department")
+            .filter(risk_id__in=risk_ids)
+            .order_by("-updated_at", "-id")
+        )
+        mitigation = _apply_updated_since_filter(mitigation, request, "updated_at")
+        paginated = _paginate_queryset(mitigation, request)
+        seralizer = MitigationSerializer(paginated["results"], many=True)
+        payload = {"data": seralizer.data, "status": status.HTTP_200_OK}
+
+        if paginated["count"] is not None:
+            payload["syncedUntil"] = timezone.now().isoformat()
+            payload["pagination"] = {
+                "page": paginated["page"],
+                "pageSize": paginated["page_size"],
+                "count": paginated["count"],
+                "next": paginated["next"],
+                "previous": paginated["previous"],
+            }
+
+        return Response(payload)
         
 
 class MitigationCRUDView(APIView):
@@ -1359,10 +1978,18 @@ class GetRiskMitigationView(APIView):
     
     @swagger_auto_schema(tags = ['Filters'])
     def get(self, request, pk, *args, **kwargs):
-        mitigations = [
-            item for item in Mitigation.objects.select_related("risk", "risk__responsible_department_id", "risk__department").filter(risk_id = pk)
-            if _can_view_mitigation(request, item)
-        ]
+        risk = _scoped_risk_queryset(request).filter(id=pk).only("id").first()
+        if not risk:
+            return Response({
+                "data": "Bunday ma'lumot topilmadi",
+                "status": status.HTTP_404_NOT_FOUND
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        mitigations = Mitigation.objects.select_related(
+            "risk",
+            "risk__responsible_department_id",
+            "risk__department",
+        ).filter(risk_id=pk)
         serializer = MitigationSerializer(mitigations, many =True)
         return Response({
             "data":serializer.data,
@@ -1375,18 +2002,41 @@ class FilterRiskByStatusView(APIView):
     
     @swagger_auto_schema(request_body=StatusSerializer, tags = ['Filters'])
     def post(self, request, *args, **kwargs):
-        risk = Risk.objects.filter(status = request.data.get("status"))
-        if risk:
-            serializer = RiskSerializer(risk, many = True)
+        requested_status = _normalize_status_token(request.data.get("status"))
+        if not requested_status:
             return Response({
-                "data":serializer.data,
-                "status":status.HTTP_200_OK
-            })
-        else:
+                "data": "Invalid or missing status",
+                "status": status.HTTP_400_BAD_REQUEST,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        risk = (
+            _scoped_risk_queryset(request)
+            .filter(status = requested_status)
+            .order_by("-updated_at", "-id")
+        )
+        risk = _apply_updated_since_filter(risk, request, "updated_at")
+        paginated = _paginate_queryset(risk, request)
+
+        if not paginated["results"]:
             return Response({
-                "data":"Bunday ma'lumot topilmadi",
-                "status":status.HTTP_404_NOT_FOUND
-            })
+                "data": "Bunday ma'lumot topilmadi",
+                "status": status.HTTP_404_NOT_FOUND
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = RiskSerializer(paginated["results"], many = True)
+        payload = {"data": serializer.data, "status": status.HTTP_200_OK}
+
+        if paginated["count"] is not None:
+            payload["syncedUntil"] = timezone.now().isoformat()
+            payload["pagination"] = {
+                "page": paginated["page"],
+                "pageSize": paginated["page_size"],
+                "count": paginated["count"],
+                "next": paginated["next"],
+                "previous": paginated["previous"],
+            }
+
+        return Response(payload)
             
             
 class UpcomingRiskAPIView(APIView):
@@ -1395,23 +2045,35 @@ class UpcomingRiskAPIView(APIView):
     def get(self, request, *args, **kwargs):
         today = timezone.now()
         ten_days_later = today + timedelta(days=10)
-        risks = Risk.objects.filter(
+        risks = _scoped_risk_queryset(request).filter(
             status__in=["OPEN", "IN_PROGRESS", "MITIGATED", "ACCEPTED"],
             due_date__gte=today,
             due_date__lte=ten_days_later
-        ).order_by("due_date") 
-        serializer = RiskSerializer(risks, many=True)
-        return Response(
-            {
-                "count": risks.count(),
-                "data": serializer.data
-            },
-            status=status.HTTP_200_OK
-        )
+        ).order_by("due_date")
+        risks = _apply_updated_since_filter(risks, request, "updated_at")
+        paginated = _paginate_queryset(risks, request)
+        serializer = RiskSerializer(paginated["results"], many=True)
+        payload = {
+            "count": paginated["count"] or risks.count(),
+            "data": serializer.data,
+            "syncedUntil": timezone.now().isoformat(),
+        }
+
+        if paginated["count"] is not None:
+            payload["pagination"] = {
+                "page": paginated["page"],
+                "pageSize": paginated["page_size"],
+                "count": paginated["count"],
+                "next": paginated["next"],
+                "previous": paginated["previous"],
+            }
+            payload["data"] = serializer.data
+
+        return Response(payload, status=status.HTTP_200_OK)
         
         
 class ReplyRiskActivityCreateView(APIView):
-    # permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated]
     
     @swagger_auto_schema(request_body=ReplyRiskActivitySerializer, tag = ['ReplyRiskActivity'])
     def post(self, request, *args, **kwargs):
@@ -1653,6 +2315,12 @@ class MeView(APIView):
     def get(self, request):
         user = request.user
         payload = request.auth or {}
+
+        cache_key = ME_PROFILE_CACHE_KEY.format(user_id=getattr(user, "id", "anonymous"))
+        cached_profile = cache.get(cache_key)
+        if isinstance(cached_profile, dict):
+            return Response(cached_profile)
+
         user_data = UserSerializer(user).data
         # Keycloak'dan kelgan qo'shimcha ma'lumotlar
         user_data["roles"] = payload.get("realm_access", {}).get("roles", [])
@@ -1672,6 +2340,7 @@ class MeView(APIView):
             user_data["department"] = None
             user_data["department_error"] = str(exc)
 
+        cache.set(cache_key, user_data, ME_PROFILE_CACHE_TTL)
         return Response(user_data)
 
 
@@ -1710,6 +2379,14 @@ class DepartmentMemberDirectoryView(APIView):
                 "detail": "The current department is not linked to a Keycloak group.",
                 "status": status.HTTP_400_BAD_REQUEST,
             }, status=status.HTTP_400_BAD_REQUEST)
+
+        directory_cache_key = DIRECTORY_MEMBERS_CACHE_KEY.format(department_id=department.id)
+        cached_members = cache.get(directory_cache_key)
+        if cached_members is not None and isinstance(cached_members, list):
+            return Response({
+                "data": cached_members,
+                "status": status.HTTP_200_OK,
+            })
 
         try:
             members = _fetch_group_members(department.keycloak_group_id)
@@ -1762,6 +2439,8 @@ class DepartmentMemberDirectoryView(APIView):
             })
 
         directory_members.sort(key=lambda item: item["name"].lower())
+
+        cache.set(directory_cache_key, directory_members, DIRECTORY_MEMBERS_CACHE_TTL)
 
         return Response({
             "data": directory_members,
