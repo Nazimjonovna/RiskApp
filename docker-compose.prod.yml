@@ -1,0 +1,19 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: riskapp-backend:prod
+    container_name: riskapp-backend
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    ports:
+      - "${BACKEND_HOST_PORT:-8000}:8000"
+    networks:
+      - riskapp-network
+
+networks:
+  riskapp-network:
+    name: riskapp-network
+    external: true
