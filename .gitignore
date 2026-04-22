@@ -40,3 +40,6 @@ htmlcov/
 # Migrations (agar kerak bo‘lmasa)
 # */migrations/*
 # !*/migrations/__init__.py
+
+git
+git.pub
