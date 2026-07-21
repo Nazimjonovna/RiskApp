@@ -1,0 +1,386 @@
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+  - template: Jobs/Dependency-Scanning.gitlab-ci.yml
+  - template: Jobs/Container-Scanning.gitlab-ci.yml
+
+stages:
+  - test
+  - docker
+  - security
+  - deploy
+  - verify
+
+default:
+  interruptible: true
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+variables:
+  PYTHON_TEST_IMAGE: mirror.gcr.io/library/python:3.11-slim-bookworm
+  PYTHON_RUNTIME_IMAGE: mirror.gcr.io/library/python:3.11-alpine
+  KANIKO_IMAGE: gcr.io/kaniko-project/executor:v1.23.2-debug
+  POSTGRES_IMAGE: mirror.gcr.io/library/postgres:16-alpine
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  CS_IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+
+cache:
+  key:
+    files:
+      - requirements.txt
+  paths:
+    - .pip-cache/
+
+backend:test:
+  stage: test
+  image: $PYTHON_TEST_IMAGE
+  services:
+    - name: $POSTGRES_IMAGE
+      alias: postgres
+  variables:
+    SECRET_KEY: ci-test-secret
+    DEBUG: "False"
+    POSTGRES_DB: rms_test
+    POSTGRES_USER: rms
+    POSTGRES_PASSWORD: rms
+    DB_NAME: rms_test
+    DB_USER: rms
+    DB_PASSWORD: rms
+    DB_HOST: postgres
+    DB_PORT: "5432"
+    DB_CONN_MAX_AGE: "0"
+    DB_CONN_HEALTH_CHECKS: "False"
+    ALLOWED_HOSTS: localhost,127.0.0.1
+    CORS_ALLOW_ALL_ORIGINS: "True"
+    OIDC_SERVER_URL: http://keycloak:8080
+    OIDC_REALM: risk-management-system
+    OIDC_RP_CLIENT_ID: frontend-client
+    OIDC_RP_CLIENT_SECRET: ""
+    RMS_DEMO_AUTH_ENABLED: "True"
+    RUN_MIGRATIONS: "false"
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends build-essential libpq-dev postgresql-client
+    - rm -rf /var/lib/apt/lists/*
+    - python -m pip install --upgrade pip
+    - pip install -r requirements.txt
+    - until pg_isready -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME"; do sleep 1; done
+  script:
+    - python manage.py check
+    - python manage.py makemigrations --check --dry-run
+    - python manage.py migrate --noinput
+    - python manage.py test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+backend:docker:
+  stage: docker
+  image:
+    name: $KANIKO_IMAGE
+    entrypoint: [""]
+  needs:
+    - backend:test
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - >
+      printf '{"auths":{"%s":{"username":"%s","password":"%s"}}}'
+      "$CI_REGISTRY" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD"
+      > /kaniko/.docker/config.json
+  script:
+    - |
+      DESTINATIONS="--destination=${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}"
+      DESTINATIONS="${DESTINATIONS} --destination=${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}"
+
+      if [ "${CI_COMMIT_BRANCH:-}" = "${CI_DEFAULT_BRANCH}" ]; then
+        DESTINATIONS="${DESTINATIONS} --destination=${CI_REGISTRY_IMAGE}:latest"
+      fi
+
+      /kaniko/executor \
+        --context "${CI_PROJECT_DIR}" \
+        --dockerfile "${CI_PROJECT_DIR}/Dockerfile" \
+        --build-arg PYTHON_BASE_IMAGE="${PYTHON_RUNTIME_IMAGE}" \
+        ${DESTINATIONS}
+
+      echo "Published backend image tags:"
+      echo "  ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}"
+      echo "  ${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}"
+      if [ "${CI_COMMIT_BRANCH:-}" = "${CI_DEFAULT_BRANCH}" ]; then
+        echo "  ${CI_REGISTRY_IMAGE}:latest"
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+container_scanning:
+  stage: security
+  needs:
+    - backend:docker
+  variables:
+    CS_IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+    CS_DOCKERFILE_PATH: Dockerfile
+    GIT_STRATEGY: fetch
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+.backend:deploy-template:
+  stage: deploy
+  image: alpine:3.20
+  needs:
+    - backend:docker
+  before_script:
+    - apk add --no-cache openssh-client
+    - mkdir -p "${CI_PROJECT_DIR}/.ssh"
+    - echo "CI_REGISTRY=${CI_REGISTRY}"
+    - getent hosts "$CI_REGISTRY" || nslookup "$CI_REGISTRY" || true
+    - |
+      if [ -n "${SSH_PRIVATE_KEY_B64:-}" ]; then
+        echo "$SSH_PRIVATE_KEY_B64" | base64 -d | tr -d '\r' > "${CI_PROJECT_DIR}/.ssh/id_ed25519"
+      elif [ -n "${SSH_PRIVATE_KEY:-}" ]; then
+        echo "$SSH_PRIVATE_KEY" | tr -d '\r' > "${CI_PROJECT_DIR}/.ssh/id_ed25519"
+      else
+        echo "SSH_PRIVATE_KEY or SSH_PRIVATE_KEY_B64 is required for Docker executor deploy jobs."
+        exit 1
+      fi
+    - chmod 600 "${CI_PROJECT_DIR}/.ssh/id_ed25519"
+    - |
+      ssh-keygen -y -f "${CI_PROJECT_DIR}/.ssh/id_ed25519" > "${CI_PROJECT_DIR}/.ssh/id_ed25519.pub"
+      echo "Deploy SSH public key fingerprint:"
+      ssh-keygen -lf "${CI_PROJECT_DIR}/.ssh/id_ed25519.pub"
+      echo "Deploy SSH public key:"
+      cat "${CI_PROJECT_DIR}/.ssh/id_ed25519.pub"
+    - |
+      : "${DEPLOY_SSH_PORT:=22}"
+      if [ -n "${SSH_KNOWN_HOSTS_B64:-}" ]; then
+        echo "$SSH_KNOWN_HOSTS_B64" | base64 -d | tr -d '\r' > "${CI_PROJECT_DIR}/.ssh/known_hosts"
+      elif [ -n "${SSH_KNOWN_HOSTS:-}" ]; then
+        echo "$SSH_KNOWN_HOSTS" | tr -d '\r' > "${CI_PROJECT_DIR}/.ssh/known_hosts"
+      else
+        ssh-keyscan -p "$DEPLOY_SSH_PORT" -H "$DEPLOY_HOST" > "${CI_PROJECT_DIR}/.ssh/known_hosts"
+      fi
+    - chmod 644 "${CI_PROJECT_DIR}/.ssh/known_hosts"
+  script:
+    - |
+      : "${DOCKER_NETWORK:=rms-network}"
+      : "${BACKEND_CONTAINER_NAME:=rms-backend}"
+      : "${BACKEND_IMAGE_NAME:=rms-backend}"
+      : "${BACKEND_HOST_PORT:=8000}"
+      : "${BACKEND_MEDIA_VOLUME:=/opt/riskapp/shared/backend-media}"
+      : "${POSTGRES_CONTAINER_NAME:=riskapp-postgres}"
+      : "${BACKEND_ENV_FILE:?BACKEND_ENV_FILE is required}"
+      : "${DEPLOY_SSH_PORT:=22}"
+
+      SSH_OPTS="-i ${CI_PROJECT_DIR}/.ssh/id_ed25519 -p ${DEPLOY_SSH_PORT} -o BatchMode=yes -o UserKnownHostsFile=${CI_PROJECT_DIR}/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+      DEPLOY_IMAGE="${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}"
+      RUN_IMAGE="${BACKEND_IMAGE_NAME}:${CI_COMMIT_REF_SLUG}"
+      REMOTE_DOCKER_CONFIG="/tmp/${CI_PROJECT_PATH_SLUG}-${CI_JOB_ID}-docker"
+
+      ssh ${SSH_OPTS} "${DEPLOY_USER}@${DEPLOY_HOST}" "
+      echo 'CI_REGISTRY=${CI_REGISTRY}'
+      getent hosts '${CI_REGISTRY}' || nslookup '${CI_REGISTRY}' || true
+      test -f '${BACKEND_ENV_FILE}'
+      mkdir -p '${BACKEND_MEDIA_VOLUME}'
+      mkdir -p '${REMOTE_DOCKER_CONFIG}'
+      chmod 700 '${REMOTE_DOCKER_CONFIG}'
+      "
+
+      printf '%s' "${CI_REGISTRY_PASSWORD}" | ssh ${SSH_OPTS} "${DEPLOY_USER}@${DEPLOY_HOST}" \
+        "DOCKER_CONFIG='${REMOTE_DOCKER_CONFIG}' docker login '${CI_REGISTRY}' -u '${CI_REGISTRY_USER}' --password-stdin"
+
+      ssh ${SSH_OPTS} "${DEPLOY_USER}@${DEPLOY_HOST}" "
+      set -eu
+      export DOCKER_CONFIG='${REMOTE_DOCKER_CONFIG}'
+      trap \"rm -rf '${REMOTE_DOCKER_CONFIG}'\" EXIT
+      docker pull '${DEPLOY_IMAGE}'
+      docker tag '${DEPLOY_IMAGE}' '${RUN_IMAGE}'
+      docker network create '${DOCKER_NETWORK}' || true
+      docker network connect '${DOCKER_NETWORK}' '${POSTGRES_CONTAINER_NAME}' >/dev/null 2>&1 || true
+      docker stop '${BACKEND_CONTAINER_NAME}' || true
+      docker rm '${BACKEND_CONTAINER_NAME}' || true
+      docker run -d --name '${BACKEND_CONTAINER_NAME}' --restart unless-stopped \
+        --label 'rms.commit=${CI_COMMIT_SHA}' \
+        --label 'rms.registry-image=${DEPLOY_IMAGE}' \
+        --network '${DOCKER_NETWORK}' \
+        --env-file '${BACKEND_ENV_FILE}' \
+        -e RUN_MIGRATIONS=true \
+        -v '${BACKEND_MEDIA_VOLUME}:/app/images' \
+        -p '${BACKEND_HOST_PORT}:8000' \
+        '${RUN_IMAGE}'
+
+      for attempt in \$(seq 1 30); do
+        status=\$(docker inspect --format='{{.State.Health.Status}}' '${BACKEND_CONTAINER_NAME}' 2>/dev/null || true)
+        if [ \"\$status\" = healthy ]; then
+          docker rmi '${DEPLOY_IMAGE}' >/dev/null 2>&1 || true
+          exit 0
+        fi
+        if [ \"\$status\" = unhealthy ]; then
+          docker logs '${BACKEND_CONTAINER_NAME}' || true
+          exit 1
+        fi
+        sleep 3
+      done
+
+      docker logs '${BACKEND_CONTAINER_NAME}' || true
+      exit 1
+      "
+
+      ssh ${SSH_OPTS} "${DEPLOY_USER}@${DEPLOY_HOST}" "docker image prune -f || true"
+
+backend:deploy:dev:
+  extends: .backend:deploy-template
+  environment:
+    name: dev
+  variables:
+    DEPLOY_HOST: $DEV_DEPLOY_HOST
+    DEPLOY_USER: $DEV_DEPLOY_USER
+    BACKEND_ENV_FILE: $DEV_BACKEND_ENV_FILE
+    BACKEND_CONTAINER_NAME: rms-backend
+    BACKEND_IMAGE_NAME: rms-backend
+    BACKEND_HOST_PORT: "8000"
+    BACKEND_MEDIA_VOLUME: /opt/riskapp/shared/backend-media
+    POSTGRES_CONTAINER_NAME: riskapp-postgres
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop" && ($SSH_PRIVATE_KEY || $SSH_PRIVATE_KEY_B64) && $DEV_DEPLOY_HOST && $DEV_DEPLOY_USER && $DEV_BACKEND_ENV_FILE
+
+backend:deploy:test:
+  extends: .backend:deploy-template
+  environment:
+    name: test
+  variables:
+    DEPLOY_HOST: $TEST_DEPLOY_HOST
+    DEPLOY_USER: $TEST_DEPLOY_USER
+    BACKEND_ENV_FILE: $TEST_BACKEND_ENV_FILE
+    BACKEND_CONTAINER_NAME: rms-backend
+    BACKEND_IMAGE_NAME: rms-backend
+    BACKEND_HOST_PORT: "8000"
+    BACKEND_MEDIA_VOLUME: /opt/riskapp/shared/backend-media
+    POSTGRES_CONTAINER_NAME: riskapp-postgres
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop" && ($SSH_PRIVATE_KEY || $SSH_PRIVATE_KEY_B64) && $TEST_DEPLOY_HOST && $TEST_DEPLOY_USER && $TEST_BACKEND_ENV_FILE
+      when: manual
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && ($SSH_PRIVATE_KEY || $SSH_PRIVATE_KEY_B64) && $TEST_DEPLOY_HOST && $TEST_DEPLOY_USER && $TEST_BACKEND_ENV_FILE
+      when: manual
+
+backend:deploy:prod:
+  extends: .backend:deploy-template
+  environment:
+    name: production
+  variables:
+    DEPLOY_HOST: $PROD_DEPLOY_HOST
+    DEPLOY_USER: $PROD_DEPLOY_USER
+    BACKEND_ENV_FILE: $PROD_BACKEND_ENV_FILE
+    BACKEND_CONTAINER_NAME: rms-backend
+    BACKEND_IMAGE_NAME: rms-backend
+    BACKEND_HOST_PORT: $PROD_BACKEND_HOST_PORT
+    BACKEND_MEDIA_VOLUME: $PROD_BACKEND_MEDIA_VOLUME
+    POSTGRES_CONTAINER_NAME: $PROD_POSTGRES_CONTAINER_NAME
+  when: manual
+  rules:
+    - if: $CI_COMMIT_TAG && ($SSH_PRIVATE_KEY || $SSH_PRIVATE_KEY_B64) && $PROD_DEPLOY_HOST && $PROD_DEPLOY_USER && $PROD_BACKEND_ENV_FILE
+      when: manual
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && ($SSH_PRIVATE_KEY || $SSH_PRIVATE_KEY_B64) && $PROD_DEPLOY_HOST && $PROD_DEPLOY_USER && $PROD_BACKEND_ENV_FILE
+      when: manual
+
+.backend:verify-template:
+  stage: verify
+  image: $PYTHON_TEST_IMAGE
+  before_script:
+    - python -m pip install --upgrade pip
+    - pip install requests==2.33.0
+
+backend:verify:prod-readiness:
+  extends: .backend:verify-template
+  environment:
+    name: production
+  script:
+    - |
+      set -eu
+      : "${PROD_FRONTEND_PUBLIC_URL:?PROD_FRONTEND_PUBLIC_URL is required}"
+      : "${PROD_FRONTEND_KEYCLOAK_URL:?PROD_FRONTEND_KEYCLOAK_URL is required}"
+
+      export RMS_FRONTEND_URL="${PROD_FRONTEND_PUBLIC_URL}"
+      export RMS_EXPECTED_APP_PUBLIC_URL="${PROD_FRONTEND_PUBLIC_URL}"
+      export RMS_EXPECTED_KEYCLOAK_URL="${PROD_FRONTEND_KEYCLOAK_URL}"
+      export RMS_EXPECTED_KEYCLOAK_REALM="${PROD_FRONTEND_KEYCLOAK_REALM:-risk-management-system}"
+      export RMS_EXPECTED_KEYCLOAK_CLIENT_ID="${PROD_FRONTEND_KEYCLOAK_CLIENT_ID:-frontend-client}"
+      export RMS_REQUIRE_HSTS="${PROD_REQUIRE_HSTS:-true}"
+
+      if [ -n "${PROD_BACKEND_HEALTH_URL:-}" ]; then
+        export RMS_BACKEND_HEALTH_URL="${PROD_BACKEND_HEALTH_URL}"
+      fi
+      if [ -n "${PROD_REQUIRE_HTTP_REDIRECT:-}" ]; then
+        export RMS_REQUIRE_HTTP_REDIRECT="${PROD_REQUIRE_HTTP_REDIRECT}"
+      fi
+      if [ -n "${PROD_TLS_VERIFY:-}" ]; then
+        export RMS_TLS_VERIFY="${PROD_TLS_VERIFY}"
+      fi
+
+      python scripts/prod_readiness.py
+  when: manual
+  rules:
+    - if: $CI_COMMIT_TAG && $PROD_FRONTEND_PUBLIC_URL && $PROD_FRONTEND_KEYCLOAK_URL
+      when: manual
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $PROD_FRONTEND_PUBLIC_URL && $PROD_FRONTEND_KEYCLOAK_URL
+      when: manual
+
+backend:verify:prod-smoke:
+  extends: .backend:verify-template
+  environment:
+    name: production
+  script:
+    - |
+      set -eu
+      : "${PROD_SMOKE_APP_BASE_URL:?PROD_SMOKE_APP_BASE_URL is required}"
+      : "${PROD_SMOKE_KEYCLOAK_URL:?PROD_SMOKE_KEYCLOAK_URL is required}"
+      : "${PROD_SMOKE_EMPLOYEE_USERNAME:?PROD_SMOKE_EMPLOYEE_USERNAME is required}"
+      : "${PROD_SMOKE_EMPLOYEE_PASSWORD:?PROD_SMOKE_EMPLOYEE_PASSWORD is required}"
+      : "${PROD_SMOKE_RISK_USERNAME:?PROD_SMOKE_RISK_USERNAME is required}"
+      : "${PROD_SMOKE_RISK_PASSWORD:?PROD_SMOKE_RISK_PASSWORD is required}"
+      : "${PROD_SMOKE_DIRECTOR_USERNAME:?PROD_SMOKE_DIRECTOR_USERNAME is required}"
+      : "${PROD_SMOKE_DIRECTOR_PASSWORD:?PROD_SMOKE_DIRECTOR_PASSWORD is required}"
+      : "${PROD_SMOKE_COMMITTEE_USERNAME:?PROD_SMOKE_COMMITTEE_USERNAME is required}"
+      : "${PROD_SMOKE_COMMITTEE_PASSWORD:?PROD_SMOKE_COMMITTEE_PASSWORD is required}"
+
+      export RMS_APP_BASE_URL="${PROD_SMOKE_APP_BASE_URL}"
+      export RMS_KEYCLOAK_URL="${PROD_SMOKE_KEYCLOAK_URL}"
+      export RMS_KEYCLOAK_REALM="${PROD_SMOKE_KEYCLOAK_REALM:-risk-management-system}"
+      export RMS_KEYCLOAK_CLIENT_ID="${PROD_SMOKE_KEYCLOAK_CLIENT_ID:-frontend-client}"
+      export RMS_EMPLOYEE_USERNAME="${PROD_SMOKE_EMPLOYEE_USERNAME}"
+      export RMS_EMPLOYEE_PASSWORD="${PROD_SMOKE_EMPLOYEE_PASSWORD}"
+      export RMS_RISK_USERNAME="${PROD_SMOKE_RISK_USERNAME}"
+      export RMS_RISK_PASSWORD="${PROD_SMOKE_RISK_PASSWORD}"
+      export RMS_DIRECTOR_USERNAME="${PROD_SMOKE_DIRECTOR_USERNAME}"
+      export RMS_DIRECTOR_PASSWORD="${PROD_SMOKE_DIRECTOR_PASSWORD}"
+      export RMS_COMMITTEE_USERNAME="${PROD_SMOKE_COMMITTEE_USERNAME}"
+      export RMS_COMMITTEE_PASSWORD="${PROD_SMOKE_COMMITTEE_PASSWORD}"
+
+      if [ -n "${PROD_SMOKE_KEYCLOAK_ADMIN_REALM:-}" ]; then
+        export RMS_KEYCLOAK_ADMIN_REALM="${PROD_SMOKE_KEYCLOAK_ADMIN_REALM}"
+      fi
+      if [ -n "${PROD_SMOKE_KEYCLOAK_ADMIN_CLIENT_ID:-}" ]; then
+        export RMS_KEYCLOAK_ADMIN_CLIENT_ID="${PROD_SMOKE_KEYCLOAK_ADMIN_CLIENT_ID}"
+      fi
+      if [ -n "${PROD_SMOKE_KEYCLOAK_ADMIN_CLIENT_SECRET:-}" ]; then
+        export RMS_KEYCLOAK_ADMIN_CLIENT_SECRET="${PROD_SMOKE_KEYCLOAK_ADMIN_CLIENT_SECRET}"
+      fi
+      if [ -n "${PROD_SMOKE_KEYCLOAK_ADMIN_USERNAME:-}" ]; then
+        export RMS_KEYCLOAK_ADMIN_USERNAME="${PROD_SMOKE_KEYCLOAK_ADMIN_USERNAME}"
+      fi
+      if [ -n "${PROD_SMOKE_KEYCLOAK_ADMIN_PASSWORD:-}" ]; then
+        export RMS_KEYCLOAK_ADMIN_PASSWORD="${PROD_SMOKE_KEYCLOAK_ADMIN_PASSWORD}"
+      fi
+
+      python scripts/prod_smoke.py
+  when: manual
+  rules:
+    - if: $CI_COMMIT_TAG && $PROD_SMOKE_APP_BASE_URL && $PROD_SMOKE_KEYCLOAK_URL && $PROD_SMOKE_EMPLOYEE_USERNAME && $PROD_SMOKE_EMPLOYEE_PASSWORD && $PROD_SMOKE_RISK_USERNAME && $PROD_SMOKE_RISK_PASSWORD && $PROD_SMOKE_DIRECTOR_USERNAME && $PROD_SMOKE_DIRECTOR_PASSWORD && $PROD_SMOKE_COMMITTEE_USERNAME && $PROD_SMOKE_COMMITTEE_PASSWORD
+      when: manual
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $PROD_SMOKE_APP_BASE_URL && $PROD_SMOKE_KEYCLOAK_URL && $PROD_SMOKE_EMPLOYEE_USERNAME && $PROD_SMOKE_EMPLOYEE_PASSWORD && $PROD_SMOKE_RISK_USERNAME && $PROD_SMOKE_RISK_PASSWORD && $PROD_SMOKE_DIRECTOR_USERNAME && $PROD_SMOKE_DIRECTOR_PASSWORD && $PROD_SMOKE_COMMITTEE_USERNAME && $PROD_SMOKE_COMMITTEE_PASSWORD
+      when: manual
