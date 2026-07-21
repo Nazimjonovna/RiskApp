@@ -3,8 +3,6 @@ from .models import (Department, Risk, RiskCommittee, Mitigation,
 from rest_framework import serializers
 from django.contrib.auth.models import User
 
-from app.services.keycloak_departments import DepartmentResolutionError, resolve_user_department
-
 
 class UserSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
@@ -64,49 +62,6 @@ class RiskSerializer(serializers.ModelSerializer):
     class Meta:
         model = Risk
         fields = '__all__'
-        extra_kwargs = {
-            "responsible": {"allow_blank": True, "required": False},
-            "risk_manager": {"allow_blank": True, "required": False},
-            "risk_derector": {"allow_blank": True, "required": False},
-            "owner": {"allow_blank": True, "required": False},
-        }
-
-    def create(self, validated_data):
-        request = self.context.get("request")
-        payload = request.auth or {} if request else {}
-        user = request.user if request else None
-
-        if user and getattr(user, "is_authenticated", False):
-            validated_data["created_by_user_id"] = (
-                payload.get("preferred_username")
-                or getattr(user, "username", "")
-                or payload.get("sub", "")
-            )
-
-            try:
-                department = resolve_user_department(payload, sync=True)
-            except DepartmentResolutionError as exc:
-                raise serializers.ValidationError(
-                    {"created_by_department_id": str(exc)}
-                )
-
-            if department is None:
-                requested_department = validated_data.get("department") or validated_data.get("responsible_department_id")
-                if requested_department:
-                    department = requested_department
-
-            if department is None:
-                raise serializers.ValidationError(
-                    {
-                        "created_by_department_id": (
-                            "Unable to determine the creator department from Keycloak groups."
-                        )
-                    }
-                )
-
-            validated_data["created_by_department_id"] = str(department.id)
-
-        return super().create(validated_data)
         
         
 class RiskCommitteeSerializer(serializers.ModelSerializer):

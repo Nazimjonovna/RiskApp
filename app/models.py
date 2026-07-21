@@ -1,3 +1,4 @@
+
 import re
 
 from django.db import models
@@ -60,6 +61,7 @@ def _unique_business_code(model_cls, source, default, current_pk=None, max_lengt
 
 class Department(models.Model):
     name = models.CharField(max_length=255)
+
     code = models.CharField(max_length=6, unique=True, null=True, blank=True)
     keycloak_group_id = models.CharField(max_length=255, unique=True, null=True, blank=True)
     keycloak_path = models.CharField(max_length=500, unique=True, null=True, blank=True)
@@ -77,6 +79,11 @@ class Department(models.Model):
                 current_pk=self.pk,
             )
         return super().save(*args, **kwargs)
+
+    keycloak_group_id = models.CharField(max_length=255, unique=True, null=True, blank=True)
+    keycloak_path = models.CharField(max_length=500, unique=True, null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
 
     def __str__(self):
         return self.name
@@ -134,7 +141,12 @@ class Risk(models.Model):
         ('CRITICAL', 'Critical')
     ]
     title = models.CharField(max_length=255)
+
     risk_number = models.CharField(max_length=24, unique=True, blank=True)
+
+    risk_number = models.CharField(max_length=20, unique=True, blank=True)
+    responsible_user = models.CharField( max_length=255,null=True,blank=True)
+
     description = models.TextField(blank=True)
     department = models.ForeignKey(
         Department,
@@ -204,9 +216,19 @@ class Risk(models.Model):
         return f"R-{category_code}-{department_code}-{sequence_code}"
 
     def save(self, *args, **kwargs):
+
         creating_without_number = self._state.adding and not self.risk_number
         if not creating_without_number:
             return super().save(*args, **kwargs)
+
+
+        if not self.risk_number:
+            last = Risk.objects.order_by("-id").first()
+            if last:
+                new_number = last.id + 1
+            else:
+                new_number = 1
+            self.risk_number = f"RISK-{new_number:03d}"
 
         super().save(*args, **kwargs)
         self.risk_number = self.build_risk_number()

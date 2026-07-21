@@ -21,4 +21,8 @@ RUN chmod +x /app/entrypoint.sh
 EXPOSE 8000
 
 ENTRYPOINT ["/app/entrypoint.sh"]
+
 CMD ["gunicorn", "-c", "gunicorn.conf.py", "conf.wsgi:application"]
+
+CMD ["gunicorn", "conf.wsgi:application", "--bind", "0.0.0.0:8000"]
+

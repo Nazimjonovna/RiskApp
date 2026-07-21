@@ -4,11 +4,18 @@ import requests
 from django.conf import settings
 
 from app.models import Department
+<<<<<<< HEAD
 from app.services.department_identity import canonical_department_key, department_identity_candidates
+=======
+>>>>>>> 6dc59e2 (f)
 
 
 _admin_token_cache = {"value": None, "expires_at": 0.0}
 _department_sync_cache = {"expires_at": 0.0}
+<<<<<<< HEAD
+=======
+_department_head_cache = {}  # {department_id: {"value": username_or_None, "expires_at": ts}}
+>>>>>>> 6dc59e2 (f)
 
 
 class DepartmentResolutionError(Exception):
@@ -37,6 +44,7 @@ def _group_display_name(group):
     )
 
 
+<<<<<<< HEAD
 def _department_match_score(department, group_id=None, path=None, *values):
     score = 0
     normalized_path = _normalize_group_path(path)
@@ -89,6 +97,8 @@ def _find_matching_department(group_id=None, path=None, *values):
     return best_department if best_score > 0 else None
 
 
+=======
+>>>>>>> 6dc59e2 (f)
 def _flatten_groups(groups):
     flat_groups = []
     for group in groups or []:
@@ -220,6 +230,109 @@ def _fetch_all_groups():
     return flat_groups
 
 
+<<<<<<< HEAD
+=======
+def _fetch_group_members(group_id):
+    members = []
+    first = 0
+    page_size = 100
+    while True:
+        try:
+            response = requests.get(
+                f"{settings.KEYCLOAK_ADMIN_BASE_URL}/groups/{group_id}/members",
+                params={"first": first, "max": page_size, "briefRepresentation": "false"},
+                headers=_admin_headers(),
+                timeout=15,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise DepartmentResolutionError(
+                "Failed to fetch Keycloak group members."
+            ) from exc
+
+        page = response.json() or []
+        members.extend(page)
+        if len(page) < page_size:
+            break
+        first += page_size
+
+    return members
+
+
+def _fetch_user_realm_roles(user_id):
+    try:
+        response = requests.get(
+            f"{settings.KEYCLOAK_ADMIN_BASE_URL}/users/{user_id}/role-mappings/realm/composite",
+            headers=_admin_headers(),
+            timeout=15,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise DepartmentResolutionError(
+            "Failed to fetch user realm roles from Keycloak Admin API."
+        ) from exc
+    return {str(role.get("name") or "") for role in response.json() or []}
+
+
+def _find_department_head_username(department):
+    """
+    Bo'lim boshlig'ini aniqlaydi: bo'lim (Keycloak group)'ga a'zo bo'lgan
+    va Keycloak'da ALLAQACHON mavjud (tayyor/default) `KEYCLOAK_DEPARTMENT_HEAD_ROLE`
+    role'iga ega bo'lgan userlardan birinchisini qaytaradi.
+
+    Hech qanday yangi role yaratilmaydi — faqat mavjud role + group a'zoligi
+    kombinatsiyasidan foydalaniladi.
+    """
+    if not department or not department.keycloak_group_id:
+        return None
+
+    head_role = str(settings.KEYCLOAK_DEPARTMENT_HEAD_ROLE or "").strip()
+    if not head_role:
+        return None
+
+    members = _fetch_group_members(department.keycloak_group_id)
+
+    candidates = []
+    for member in members:
+        user_id = member.get("id")
+        if not user_id:
+            continue
+        roles = _fetch_user_realm_roles(user_id)
+        if head_role in roles:
+            candidates.append(member.get("username") or user_id)
+
+    if not candidates:
+        return None
+    return candidates[0]
+
+
+def resolve_department_head(department, force=False):
+    """
+    `department` uchun boshliq username'ini qaytaradi (Keycloak'dan real vaqtda
+    so'rov jo'natib). Natija qisqa muddatga cache qilinadi.
+
+    Topilmasa yoki Admin API sozlanmagan bo'lsa -> None qaytadi.
+    """
+    if department is None:
+        return None
+    if not _admin_api_is_configured():
+        return None
+
+    now = time.time()
+    cached = _department_head_cache.get(department.id)
+    if not force and cached and cached["expires_at"] > now:
+        return cached["value"]
+
+    username = _find_department_head_username(department)
+
+    _department_head_cache[department.id] = {
+        "value": username,
+        "expires_at": now + max(settings.KEYCLOAK_DEPARTMENT_HEAD_CACHE_TTL, 0),
+    }
+    return username
+
+
+>>>>>>> 6dc59e2 (f)
 def _fetch_user_groups(user_id):
     try:
         response = requests.get(
@@ -236,6 +349,7 @@ def _fetch_user_groups(user_id):
     return _flatten_groups(response.json())
 
 
+<<<<<<< HEAD
 def _fetch_group_members(group_id):
     members = []
     first = 0
@@ -268,6 +382,8 @@ def _fetch_group_members(group_id):
     return members
 
 
+=======
+>>>>>>> 6dc59e2 (f)
 def _department_groups(groups):
     prefix = _normalize_group_path(settings.KEYCLOAK_DEPARTMENT_GROUP_PATH_PREFIX)
     if not prefix:
@@ -301,7 +417,25 @@ def _upsert_department(group):
     technical_name = str(group.get("name") or _group_name_from_path(path)).strip()
     display_name = _group_display_name(group)
 
+<<<<<<< HEAD
     department = _find_matching_department(group_id, path, display_name, technical_name)
+=======
+    department = None
+    if group_id:
+        department = Department.objects.filter(keycloak_group_id=group_id).first()
+    if department is None and path:
+        department = Department.objects.filter(keycloak_path=path).first()
+    if department is None and display_name:
+        department = Department.objects.filter(
+            keycloak_group_id__isnull=True,
+            name=display_name,
+        ).first()
+    if department is None and technical_name:
+        department = Department.objects.filter(
+            keycloak_group_id__isnull=True,
+            name=technical_name,
+        ).first()
+>>>>>>> 6dc59e2 (f)
 
     defaults = {
         "name": display_name,
@@ -347,6 +481,7 @@ def sync_departments_from_keycloak(force=False):
     return _department_list_queryset()
 
 
+<<<<<<< HEAD
 def _resolve_departments_for_group_paths(group_paths):
     matches = []
     seen_ids = set()
@@ -362,6 +497,8 @@ def _resolve_departments_for_group_paths(group_paths):
     return matches
 
 
+=======
+>>>>>>> 6dc59e2 (f)
 def _token_group_paths(payload):
     groups = payload.get("groups") or []
     return sorted(
@@ -401,6 +538,7 @@ def ensure_departments_for_group_paths(group_paths):
         if not normalized_path:
             continue
 
+<<<<<<< HEAD
         department = _upsert_department(
             {
                 "id": None,
@@ -410,6 +548,16 @@ def ensure_departments_for_group_paths(group_paths):
             }
         )
         if not department.is_active:
+=======
+        department = Department.objects.filter(keycloak_path=normalized_path).first()
+        if department is None:
+            department = Department.objects.create(
+                name=_group_name_from_path(normalized_path),
+                keycloak_path=normalized_path,
+                is_active=True,
+            )
+        elif not department.is_active:
+>>>>>>> 6dc59e2 (f)
             department.is_active = True
             department.save(update_fields=["is_active"])
         created.append(department)
@@ -431,6 +579,7 @@ def resolve_user_department(payload, sync=False):
     if not group_paths:
         return None
 
+<<<<<<< HEAD
     departments_with_paths = [
         (department, matched_path)
         for department, matched_path in _resolve_departments_for_group_paths(group_paths)
@@ -454,9 +603,32 @@ def resolve_user_department(payload, sync=False):
     if len(departments_with_paths) > 1:
         top_length = len(departments_with_paths[0][1] or departments_with_paths[0][0].keycloak_path or "")
         second_length = len(departments_with_paths[1][1] or departments_with_paths[1][0].keycloak_path or "")
+=======
+    departments = list(
+        Department.objects.filter(
+            is_active=True,
+            keycloak_path__in=group_paths,
+        ).order_by("name")
+    )
+
+    if not departments:
+        departments = ensure_departments_for_group_paths(group_paths)
+
+    if not departments:
+        return None
+
+    departments.sort(key=lambda department: len(department.keycloak_path or ""), reverse=True)
+    if len(departments) > 1:
+        top_length = len(departments[0].keycloak_path or "")
+        second_length = len(departments[1].keycloak_path or "")
+>>>>>>> 6dc59e2 (f)
         if top_length == second_length:
             raise DepartmentResolutionError(
                 "User belongs to multiple Keycloak departments. Narrow the group mapping."
             )
 
+<<<<<<< HEAD
     return departments_with_paths[0][0]
+=======
+    return departments[0]
+>>>>>>> 6dc59e2 (f)

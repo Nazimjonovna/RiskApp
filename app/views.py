@@ -28,14 +28,6 @@ from drf_yasg.utils import swagger_auto_schema
 from .serializers import (RiskActivitySerializer, RiskCommitteeSerializer, RiskDecisionSerializer,
                           RiskSerializer, MitigationSerializer, DepartmentSerializer, StatusSerializer,
                           CategorySerializer, ReplyRiskActivitySerializer, UserSerializer)
-from .services.keycloak_departments import (
-    DepartmentResolutionError,
-    _fetch_group_members,
-    get_user_group_paths,
-    resolve_user_department,
-    sync_departments_from_keycloak,
-)
-from .services.department_identity import canonical_department_key
 from .models import (Department, Category,  Risk, RiskActivity, RiskCommittee, RiskDecition,
                      Mitigation, ReplyRiskActivity)
 
@@ -978,19 +970,7 @@ class DepartmentView(APIView):
             
     @swagger_auto_schema(tags = ['Department'])
     def get(self, request, *args,**kwargs):
-        cached_response = _get_department_reference_payload_from_cache()
-        if cached_response is not None:
-            return Response(cached_response)
-
-        try:
-            departments = sync_departments_from_keycloak()
-        except Exception:
-            departments = Department.objects.filter(
-                is_active=True,
-                keycloak_path__isnull=False,
-            ).order_by("name")
-            if not departments.exists():
-                departments = Department.objects.filter(is_active=True).order_by("name")
+        departments = Department.objects.all()
         serializer = DepartmentSerializer(departments, many = True)
         response_payload = {
             "data":serializer.data,
@@ -1145,7 +1125,7 @@ class CreateRiskView(APIView):
     
     @swagger_auto_schema(request_body=RiskSerializer, tags=['Risk'])
     def post(self, request, *args, **kwargs):
-        serializer = RiskSerializer(data=request.data, context={"request": request})
+        serializer = RiskSerializer(data=request.data)
 
         if serializer.is_valid():
             risk = serializer.save()
@@ -1278,12 +1258,7 @@ class RiskCRUDView(APIView):
                 payload_data["responsible_department_id"] = request_department.id
 
             old_risk = Risk.objects.get(id=pk)
-            serializer = RiskSerializer(
-                instance=risk,
-                data=payload_data,
-                partial=True,
-                context={"request": request},
-            )
+            serializer = RiskSerializer(instance = risk, data = request.data, partial = True)
             if serializer.is_valid():
                 updated_risk = serializer.save()
                 if "responsible" in payload_data:
@@ -1311,19 +1286,8 @@ class UserRiskCrudView(APIView):
         risk = Risk.objects.filter(id =pk).first()
         if risk:
             old_risk = Risk.objects.get(id=pk)
-            if not _is_risk_creator(request, old_risk):
-                return Response({
-                    "detail": "Only the risk creator can update this record.",
-                    "status": status.HTTP_403_FORBIDDEN,
-                }, status=status.HTTP_403_FORBIDDEN)
-
-            if _normalize_status_token(old_risk.status) in CREATOR_EDITABLE_RISK_STATUSES:
-                serializer = RiskSerializer(
-                    instance=risk,
-                    data=request.data,
-                    partial=True,
-                    context={"request": request},
-                )
+            if old_risk.status == "DRAFT":
+                serializer = RiskSerializer(instance = risk, data = request.data, partial = True)
                 if serializer.is_valid():
                     updated_risk = serializer.save()
                     notify_risk_update(old_risk, updated_risk)
@@ -2325,124 +2289,5 @@ class MeView(APIView):
         # Keycloak'dan kelgan qo'shimcha ma'lumotlar
         user_data["roles"] = payload.get("realm_access", {}).get("roles", [])
         user_data["keycloak_id"] = payload.get("sub")
-        user_data["groups"] = get_user_group_paths(payload)
 
-        try:
-            department = resolve_user_department(payload, sync=True)
-            user_data["department_id"] = department.id if department else None
-            user_data["department_name"] = department.name if department else None
-            user_data["department"] = (
-                DepartmentSerializer(department).data if department else None
-            )
-        except DepartmentResolutionError as exc:
-            user_data["department_id"] = None
-            user_data["department_name"] = None
-            user_data["department"] = None
-            user_data["department_error"] = str(exc)
-
-        cache.set(cache_key, user_data, ME_PROFILE_CACHE_TTL)
         return Response(user_data)
-
-
-class DepartmentMemberDirectoryView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request):
-        if not has_logical_role(request, "dept-director"):
-            return Response({
-                "detail": "Only department directors can view department members.",
-                "status": status.HTTP_403_FORBIDDEN,
-            }, status=status.HTTP_403_FORBIDDEN)
-
-        payload = request.auth or {}
-
-        try:
-            department = resolve_user_department(payload, sync=True)
-        except DepartmentResolutionError as exc:
-            return Response({
-                "detail": str(exc),
-                "status": status.HTTP_400_BAD_REQUEST,
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        if department is None:
-            return Response({
-                "detail": "Unable to determine your department from Keycloak groups.",
-                "status": status.HTTP_400_BAD_REQUEST,
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        if not department.keycloak_group_id:
-            sync_departments_from_keycloak(force=True)
-            department.refresh_from_db()
-
-        if not department.keycloak_group_id:
-            return Response({
-                "detail": "The current department is not linked to a Keycloak group.",
-                "status": status.HTTP_400_BAD_REQUEST,
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        directory_cache_key = DIRECTORY_MEMBERS_CACHE_KEY.format(department_id=department.id)
-        cached_members = cache.get(directory_cache_key)
-        if cached_members is not None and isinstance(cached_members, list):
-            return Response({
-                "data": cached_members,
-                "status": status.HTTP_200_OK,
-            })
-
-        try:
-            members = _fetch_group_members(department.keycloak_group_id)
-        except DepartmentResolutionError as exc:
-            return Response({
-                "detail": str(exc),
-                "status": status.HTTP_400_BAD_REQUEST,
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        request_identities = _request_identity_candidates(request)
-        seen_usernames = set()
-        directory_members = []
-
-        for member in members:
-            username = str(member.get("username") or "").strip()
-            email = str(member.get("email") or "").strip()
-            keycloak_id = str(member.get("id") or "").strip()
-
-            if not username or username.startswith("service-account-"):
-                continue
-
-            member_identities = {
-                _normalize_identity_value(username),
-                _normalize_identity_value(email),
-                _normalize_identity_value(keycloak_id),
-            }
-            member_identities.discard("")
-
-            if request_identities & member_identities:
-                continue
-
-            normalized_username = _normalize_identity_value(username)
-            if normalized_username in seen_usernames:
-                continue
-
-            seen_usernames.add(normalized_username)
-            directory_members.append({
-                "id": keycloak_id or username,
-                "keycloak_id": keycloak_id or None,
-                "username": username,
-                "email": email,
-                "first_name": str(member.get("firstName") or "").strip(),
-                "last_name": str(member.get("lastName") or "").strip(),
-                "full_name": _directory_member_label(member),
-                "name": _directory_member_label(member),
-                "department_id": department.id,
-                "department_name": department.name,
-                "department": DepartmentSerializer(department).data,
-                "is_active": bool(member.get("enabled", True)),
-            })
-
-        directory_members.sort(key=lambda item: item["name"].lower())
-
-        cache.set(directory_cache_key, directory_members, DIRECTORY_MEMBERS_CACHE_TTL)
-
-        return Response({
-            "data": directory_members,
-            "status": status.HTTP_200_OK,
-        })
